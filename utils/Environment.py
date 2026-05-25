@@ -180,35 +180,15 @@ class PathEnv:
         return self.state
 
     def _read_hex_coords(self, row):
-        """从 CSV 行中读取 hex cube 坐标。支持新(cube)旧(grid)两种格式。"""
-        # 新格式: q_o, r_o, s_o
-        if all(c in row.index for c in ['q_o', 'r_o', 's_o']):
-            q_o = float(row['q_o'])
-            r_o = float(row['r_o'])
-            s_o = float(row['s_o'])
-            q_d = float(row['q_d'])
-            r_d = float(row['r_d'])
-            s_d = float(row['s_d'])
-            return (q_o, r_o, s_o), (q_d, r_d, s_d)
+        """从 CSV 行中读取 hex cube 坐标。"""
+        q_o = float(row['q_o'])
+        r_o = float(row['r_o'])
+        s_o = float(row['s_o'])
+        q_d = float(row['q_d'])
+        r_d = float(row['r_d'])
+        s_d = float(row['s_d'])
 
-        # 旧格式: locx_o, locy_o → 转 hex（通过 grid → wgs84 → hex pkl 查找）
-        if all(c in row.index for c in ['locx_o', 'locy_o']):
-            from utils.geo_utils import grid_to_wgs84
-            locx_o = float(row['locx_o'])
-            locy_o = float(row['locy_o'])
-            locx_d = float(row['locx_d'])
-            locy_d = float(row['locy_d'])
-
-            lon_o, lat_o = grid_to_wgs84(locx_o, locy_o)
-            lon_d, lat_d = grid_to_wgs84(locx_d, locy_d)
-
-            # 查找最近 hex cell
-            hex_o = self._wgs84_to_hex(lon_o, lat_o)
-            hex_d = self._wgs84_to_hex(lon_d, lat_d)
-            return hex_o, hex_d
-
-        raise KeyError(f"CSV row must have cube coords (q_o,r_o,s_o) or grid coords (locx_o,locy_o). "
-                       f"Got columns: {list(row.index)}")
+        return (q_o, r_o, s_o), (q_d, r_d, s_d)
 
     def _build_hex_spatial_index(self):
         """为 hex_mapdata_raw 构建 kd-tree 空间索引。"""

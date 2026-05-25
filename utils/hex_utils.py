@@ -15,36 +15,29 @@ import numpy as np
 # ============================================================
 # 常量
 # ============================================================
-SIDE_LENGTH = 200
 HEX_RADIUS = 199            # max cube distance from hex center
-TOTAL_CELLS = 3 * SIDE_LENGTH**2 - 3 * SIDE_LENGTH + 1  # 119401
 
-# 平顶六边形 6 个方向（cube 坐标偏移量）
-#      |z/s
-#      |
-#      |
-#      /\
-#     /  \
-#    /    \
-#   y/r    x/q
-HEX_DIRECTIONS =  [
-    (1, 0, -1),   # 0: NE
-    (1, -1, 0),   # 1: E
-    (0, -1, 1),   # 2: SE
-    (-1, 0, 1),   # 3: SW
-    (-1, 1, 0),   # 4: W
-    (0, 1, -1),   # 5: NW
-    (0, 0, 0),    # 6: self
+# 平顶六边形 6 个方向（cube 坐标偏移量），坐标轴穿过节点
+# 正右方为x轴正方向，逆时针120度为z轴正方向，剩下的y轴满足 q+r+s=0
+# 动作编号逆时针从正北开始，每60度一个方向: 0=北, 1=西北, 2=西南, 3=南, 4=东南, 5=东北
+HEX_DIRECTIONS = [
+    (+1, -1,  0),   # 0: 北 North
+    ( 0, -1, +1),   # 1: 西北 Northwest
+    (-1,  0, +1),   # 2: 西南 Southwest
+    (-1, +1,  0),   # 3: 南 South
+    ( 0, +1, -1),   # 4: 东南 Southeast
+    (+1,  0, -1),   # 5: 东北 Northeast
 ]
 
 # action → radius-1 邻域中的索引
-# ring 顺序从 东 开始: [dir4, dir5, dir0, dir1, dir2, dir3]
-# neighbor 列表: [center] + ring → [center, dir4, dir5, dir0, dir1, dir2, dir3]
-# 所以 action i 在 neighbor 中的位置 = ring.index(HEX_DIRECTIONS[i]) + 1
-ACTION_TO_HEX_IDX = {0: 3, 1: 4, 2: 5, 3: 6, 4: 1, 5: 2}
+# ring 顺序从 北 开始（逆时针）: [dir0, dir1, dir2, dir3, dir4, dir5]
+# neighbor 列表: [center] + ring → [center, dir0(北), dir1(西北), dir2(西南), dir3(南), dir4(东南), dir5(东北)]
+# 所以 action i 在 neighbor 中的位置 = i + 1
+ACTION_TO_HEX_IDX = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6}
 
 # 道路模式位掩码（与 GridModesAdjacentRealworld.pkl / tools.py 一致）
 # 县道、普铁、省道、高速收费站、高速、国道、高铁、火车站
+#["has_xd", "has_pt", "has_sd", "has_gs_sfz", "has_gs", "has_gd", "has_gt", "has_hcz"]
 MODE_LIST = ['GSD', 'GG', 'TS', 'TG']
 
 
@@ -81,17 +74,18 @@ def hex_neighbors(q, r, s):
 # ============================================================
 def _hex_ring_offsets(radius):
     """
-    返回"恰好距离中心 radius 步"的所有 cube 偏移量，按固定顺序排列。
-    从 HEX_DIRECTIONS[4] 方向起始点开始，绕 6 条边走一圈。
+    返回"恰好距离中心 radius 步"的所有 cube 偏移量，按逆时针排列。
+    从北方向 (dir0) 起始，逆时针绕 6 条边走一圈。
     """
     if radius == 0:
         return [(0, 0, 0)]
     offsets = []
-    # 起始点：从中心向 dir4 走 radius 步
-    d_start = HEX_DIRECTIONS[4]  # (-1, +1, 0)
+    # 起始点：北侧节点 (dir0 * radius)
+    d_start = HEX_DIRECTIONS[0]  # (+1, -1, 0) = 北
     q, r, s = d_start[0] * radius, d_start[1] * radius, d_start[2] * radius
-    # 沿 6 个方向各走 radius 步
-    for d_idx in range(6):
+    # 逆时针走边顺序: dir2→dir3→dir4→dir5→dir0→dir1
+    edge_order = [2, 3, 4, 5, 0, 1]
+    for d_idx in edge_order:
         dq, dr, ds = HEX_DIRECTIONS[d_idx]
         for _ in range(radius):
             offsets.append((q, r, s))
