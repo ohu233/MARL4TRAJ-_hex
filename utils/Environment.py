@@ -15,7 +15,7 @@ from utils.hex_utils import (
 )
 
 
-"""TODO
+"""
 1. 多路网环境下避免换乘应该安排在下层PathEnv中实现，而不是ModeEnv中：
     - 安排在上层容易使上层任务耦合过度，奖励设计等趋于复杂
     - 安排在下层可以增强可解释性，更符合直觉，并能够避免下层过于类似搜索算法，且没有搜索算法性能优秀，失去强化学习的意义
@@ -26,8 +26,6 @@ from utils.hex_utils import (
 """
 
 
-# global variables
-dxdy_dict = {i: d for i, d in enumerate(HEX_DIRECTIONS)}  # 0..5 -> 六边形方向
 modelist = ['GSD', 'GG', 'TS', 'TG']
 
 
@@ -43,7 +41,7 @@ class PathEnv:
                  mapdata: dict = None,
                  traj: pd.DataFrame = None,
                  FOV: int = 3,
-                 distance_threshold: float = 0.0,
+                 distance_threshold: float = 1.0,
                  ):
 
         self.selected_mode = selected_mode
@@ -102,6 +100,7 @@ class PathEnv:
         # 计算当前轨迹索引
         current_traj_idx = self.traj_cnt % len(self.traj)
 
+        # 训练模式下随机选择 mode 组合（必然包含真实mode）
         if self.train_mode:
             max_modes = self.max_mode_count if self.curriculum_mode else len(modelist)
             max_modes = max(1, min(max_modes, len(modelist)))
@@ -181,14 +180,14 @@ class PathEnv:
 
     def _read_hex_coords(self, row):
         """从 CSV 行中读取 hex cube 坐标。"""
-        q_o = float(row['q_o'])
-        r_o = float(row['r_o'])
-        s_o = float(row['s_o'])
-        q_d = float(row['q_d'])
-        r_d = float(row['r_d'])
-        s_d = float(row['s_d'])
+        locxo = float(row['locxo'])
+        locyo = float(row['locyo'])
+        loczo = float(row['loczo'])
+        locxd = float(row['locxd'])
+        locyd = float(row['locyd'])
+        loczd = float(row['loczd'])
 
-        return (q_o, r_o, s_o), (q_d, r_d, s_d)
+        return (locxo, locyo, loczo), (locxd, locyd, loczd)
 
     def _build_hex_spatial_index(self):
         """为 hex_mapdata_raw 构建 kd-tree 空间索引。"""
@@ -229,22 +228,19 @@ class PathEnv:
         if self.traj is None or len(self.traj) == 0:
             return [self.traj]
 
-        required_cols_new = {'q_o', 'r_o', 's_o', 'q_d', 'r_d', 's_d'}
-        required_cols_old = {'locx_o', 'locy_o', 'locx_d', 'locy_d'}
+        required_cols = {'locxo', 'locyo', 'loczo', 'locxd', 'locyd', 'loczd'}
 
         df = self.traj.copy().reset_index(drop=True)
 
-        if required_cols_new.issubset(df.columns):
+        if required_cols.issubset(df.columns):
             df['_dist'] = df.apply(
                 lambda r: hex_distance(
-                    (r['q_o'], r['r_o'], r['s_o']),
-                    (r['q_d'], r['r_d'], r['s_d']),
+                    (r['locxo'], r['locyo'], r['loczo']),
+                    (r['locxd'], r['locyd'], r['loczd']),
                 ), axis=1
             )
-        elif required_cols_old.issubset(df.columns):
-            df['_dist'] = (df['locx_d'] - df['locx_o']).abs() + (df['locy_d'] - df['locy_o']).abs()
         else:
-            raise ValueError(f"Trajectory dataframe missing required columns: {required_cols_new} or {required_cols_old}")
+            raise ValueError(f"Trajectory dataframe missing required columns: {required_cols}")
 
         bins = min(num_stages, max(1, int(df['_dist'].nunique())))
         if bins == 1:
@@ -276,23 +272,22 @@ class PathEnv:
     def calculate_reward(self, reward, prev_dist, curr_dist, neighbor, action):
         '''
         改进后的奖励函数（hex 版本）。
-        neighbor: 半径1六边形邻域特征 [center, dir4, dir5, dir0, dir1, dir2, dir3]
+        neighbor: 半径1六边形邻域 [center, dir0(北), dir1(西北), dir2(西南), dir3(南), dir4(东南), dir5(东北)]
         '''
         is_on_road = neighbor[ACTION_TO_HEX_IDX[action]] != 0
         dist_change = prev_dist - curr_dist
 
-        if is_on_road:
-            reward += 1
-            if dist_change > 0:
-                reward += 3
-            else:
-                reward -= 0.5
+        # 接近目标就给正奖励，远离则惩罚
+        if dist_change > 0:
+            reward += 2
         else:
             reward -= 0.5
-            if dist_change > 0:
-                reward -= 0.7
-            else:
-                reward -= 3
+
+        # 在路上额外加分
+        if is_on_road:
+            reward += 1
+        else:
+            reward -= 0.5
 
         # 步数惩罚：鼓励尽快到达
         reward -= 0.5
@@ -331,7 +326,7 @@ class PathEnv:
 
         visit_count = self.node_memory.get(pos_key)
         self.state['visit_count'] = visit_count
-        reward -= min(visit_count * 2, 4)
+        reward -= min(visit_count * 2, 2)
 
         # 更新绝对坐标
         self.hex_start = hex_add(self.hex_start, HEX_DIRECTIONS[action])
@@ -475,16 +470,10 @@ class ModeEnv:
 
         # 读取前一个终点的 cube 坐标
         try:
-            if all(c in prev_row.index for c in ['q_d', 'r_d', 's_d']):
-                q = int(round(float(prev_row["q_d"])))
-                r = int(round(float(prev_row["r_d"])))
-                s = int(round(float(prev_row["s_d"])))
-            elif all(c in prev_row.index for c in ['locx_d', 'locy_d']):
-                q = int(round(float(prev_row["locx_d"])))
-                r = int(round(float(prev_row["locy_d"])))
-                s = -(q + r)
-            else:
-                return self._default_mode_mask()
+            if all(c in prev_row.index for c in ['locxd', 'locyd', 'loczd']):
+                q = int(round(float(prev_row["locxd"])))
+                r = int(round(float(prev_row["locyd"])))
+                s = int(round(float(prev_row["loczd"])))
         except Exception:
             return self._default_mode_mask()
 
@@ -638,7 +627,7 @@ class ModeEnv:
         self.state["previous"] = copy.deepcopy(self.state["current"])
 
         time = float(self.current_row['time'].iat[0])
-        distance = float(self.current_row['distance'].iat[0])
+        distance = float(self.current_row['distance_km'].iat[0])
         velocity = float(self.current_row['velocity'].iat[0])
 
         prev_mask = np.asarray(self.state["current"]["mode"], dtype=np.int64)
@@ -709,52 +698,94 @@ if __name__ == "__main__":
     if TEST_ENV == 'Path':
         print("Loading hex mapdata...")
         hex_mapdata_raw = load_hex_mapdata_raw('data/hex_grid.pkl')
+        traj = pd.read_csv('data\\artificial_od_all.csv')
 
-        # 使用旧格式 CSV (grid coords) 测试
-        traj = pd.read_csv('data/data_lower_train_random.csv')
+        pathenv = PathEnv(train_mode=True, mapdata=hex_mapdata_raw, traj=traj,
+                          FOV=3, distance_threshold=1.0)
 
-        pathenv = PathEnv(train_mode=True, mapdata=hex_mapdata_raw, traj=traj, FOV=3, distance_threshold=1.0)
+        # ====== 基础信息 ======
+        print("====== PathEnv 环境检测 ======")
+        print(f"  FOV: {pathenv.FOV}")
+        print(f"  train_mode: {pathenv.train_mode}")
+        print(f"  curriculum_mode: {pathenv.curriculum_mode}")
+        print(f"  轨迹数量: {len(pathenv.traj)}")
 
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_filename = f"env_test_log_{timestamp}.txt"
+        # ====== 单次 reset 检测 ======
+        state = pathenv.reset()
+        print(f"\n====== Reset 检测 ======")
+        print(f"  hex_start: {pathenv.hex_start}")
+        print(f"  hex_end:   {pathenv.hex_end}")
+        print(f"  hex_dist:  {hex_distance(pathenv.hex_start, pathenv.hex_end)}")
+        print(f"  selected_mode: {pathenv.selected_mode}")
+        print(f"  max_step: {pathenv.max_step}")
 
-        with open(log_filename, 'w', encoding='utf-8') as log_file:
-            log_file.write("开始测试环境...\n")
+        # 检查 state 各字段
+        print(f"\n  state keys: {list(state.keys())}")
+        for k in ['current_position', 'remaining_distance', 'total_distance']:
+            v = state[k]
+            print(f"  {k}: shape={np.array(v).shape}, value={v}")
+        for k in ['current_mode', 'candidate_modes', 'visit_count']:
+            print(f"  {k}: {state[k]}")
 
-            for episode in range(5):
-                log_file.write(f"\n===== Episode {episode + 1} =====\n")
-                state = pathenv.reset()
-                log_file.write(f"初始状态 - {state}\n")
-                log_file.write(f"hex_start: {pathenv.hex_start}, hex_end: {pathenv.hex_end}\n")
-                log_file.write(f"初始neighbor: {pathenv.neighbor}\n")
-                log_file.write(f"==================================\n")
-                step = 0
-                done = False
-                total_reward = 0
+        patch = np.array(state['patch'])
+        n_cells = 3 * pathenv.FOV**2 + 3 * pathenv.FOV + 1
+        print(f"  patch: shape={patch.shape}, expected 5×{n_cells}={5*n_cells}")
+        assert patch.shape == (5 * n_cells,), \
+            f"patch shape mismatch: {patch.shape} != ({5 * n_cells},)"
+        print(f"  patch[0:{n_cells}] (multi) 非零数: {np.count_nonzero(patch[:n_cells])}")
+        for i, m in enumerate(['TG', 'GG', 'GSD', 'TS'], 1):
+            ch = patch[i*n_cells:(i+1)*n_cells]
+            nonzero = np.count_nonzero(ch)
+            active = "✓" if m in pathenv.selected_mode else "✗(zero)"
+            print(f"  patch[{i}*{n_cells}:] ({m}): 非零数={nonzero}, active={active}")
 
-                while not done:
-                    action = np.random.randint(len(dxdy_dict))
-                    prev_pos = pathenv.hex_start
-                    state, r, done, succ = pathenv.step(action)
-                    total_reward += r
-                    step += 1
+        # neighbor 检查
+        print(f"\n  neighbor (radius=1): {pathenv.neighbor}")
+        print(f"  neighbor shape: {pathenv.neighbor.shape}")
+        assert len(pathenv.neighbor) == 7, f"neighbor should have 7 cells, got {len(pathenv.neighbor)}"
 
-                    log_file.write(f"Step {step}: action={action}, "
-                                   f"pos={prev_pos}->{pathenv.hex_start}, "
-                                   f"reward={r:.2f}\n")
+        # ====== 动作映射检测 ======
+        from utils.hex_utils import ACTION_TO_HEX_IDX, HEX_DIRECTIONS
+        action_names = ['北', '西北', '西南', '南', '东南', '东北']
+        print(f"\n====== 动作方向检测 ======")
+        for a in range(6):
+            idx = ACTION_TO_HEX_IDX[a]
+            dq, dr, ds = HEX_DIRECTIONS[a]
+            nbr_val = pathenv.neighbor[idx]
+            print(f"  action {a} ({action_names[a]}): "
+                  f"offset=({dq:+d},{dr:+d},{ds:+d}), "
+                  f"neighbor[{idx}]={'on_road' if nbr_val != 0 else 'off_road'}")
 
-                    if done:
-                        log_file.write(f"Episode结束! total_reward={total_reward:.2f}\n")
-                        break
+        # ====== 随机 rollout ======
+        print(f"\n====== 随机 Rollout (3 episodes) ======")
+        for ep in range(3):
+            state = pathenv.reset()
+            total_reward = 0.0
+            step = 0
+            done = False
+            traj = [pathenv.hex_start]
+            while not done:
+                action = np.random.randint(0, 6)
+                state, r, done, succ = pathenv.step(action)
+                total_reward += r
+                step += 1
+                traj.append(pathenv.hex_start)
+                if done:
+                    break
+            final_dist = hex_distance(pathenv.hex_start, pathenv.hex_end)
+            print(f"  Ep {ep+1}: steps={step}, reward={total_reward:.1f}, "
+                  f"success={succ}, final_dist={final_dist}, "
+                  f"mode={pathenv.selected_mode}, trans={pathenv.min_trans_count}")
+
+        print(f"\n====== 环境检测完成 ======")
 
     elif TEST_ENV == 'Mode':
         print("Loading hex mapdata...")
         hex_mapdata_raw = load_hex_mapdata_raw('data/hex_grid.pkl')
-        traj = pd.read_csv('data/data_lower_train_ordered.csv')
+        traj = pd.read_csv('data/artificial_od_all.csv')
 
         if "velocity" not in traj.columns:
-            traj["velocity"] = traj["distance"] / traj["time"].replace(0, np.nan)
+            traj["velocity"] = traj["distance_km"] / traj["time"].replace(0, np.nan)
             traj["velocity"] = traj["velocity"].fillna(0.0)
 
         modeenv = ModeEnv(model_path='PathModel/PathModel.pth',

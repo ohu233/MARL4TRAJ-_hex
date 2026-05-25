@@ -115,9 +115,12 @@ def train_sac_on_pathenv(
 
     print(f"Curriculum enabled: {len(stage_trajs)} stages.")
     for sid, stage_df in enumerate(stage_trajs):
-        stage_dist = (
-            (stage_df['locx_d'] - stage_df['locx_o']).abs()
-            + (stage_df['locy_d'] - stage_df['locy_o']).abs()
+        from utils.hex_utils import hex_distance
+        stage_dist = stage_df.apply(
+            lambda r: hex_distance(
+                (r['locxo'], r['locyo'], r['loczo']),
+                (r['locxd'], r['locyd'], r['loczd']),
+            ), axis=1
         )
         print(
             f"  stage={sid + 1}/{len(stage_trajs)}, samples={len(stage_df)}, "
@@ -144,7 +147,7 @@ def train_sac_on_pathenv(
             ns, r, done, success = env.step(int(a))
             ns_vec = state_to_vector(ns)
 
-            traj_list.append((env.locx_start, env.locy_start))
+            traj_list.append(env.hex_start)
 
             agent.replay.push(s_vec, a, r, ns_vec, float(done))
             s_vec = ns_vec
@@ -319,22 +322,15 @@ if __name__ == "__main__":
     from utils.hex_utils import load_hex_mapdata_raw
 
     mapdata = load_hex_mapdata_raw('data/hex_grid.pkl')
-    traj = pd.read_csv('data/data_lower_train_random.csv')
+    traj = pd.read_csv('data//artificial_od_all.csv')
 
     # 对调换起点和终点进行训练，增加数据多样性
-    # 注意: 使用 cube 坐标时需同时调换 (q_o,r_o,s_o)↔(q_d,r_d,s_d)
-    if 'q_o' in traj.columns:
-        reversed_traj = traj.copy()
-        for col in ['q_o', 'q_d', 'r_o', 'r_d', 's_o', 's_d']:
-            if col in reversed_traj.columns:
-                o_col = col.replace('_o', '_d') if '_o' in col else col.replace('_d', '_o')
-                reversed_traj[[col, o_col]] = reversed_traj[[o_col, col]]
-        traj = pd.concat([traj, reversed_traj], ignore_index=True)
-    else:
-        reversed_traj = traj.copy()
-        reversed_traj[['locx_o','locx_d']] = reversed_traj[['locx_d','locx_o']]
-        reversed_traj[['locy_o','locy_d']] = reversed_traj[['locy_d','locy_o']]
-        traj = pd.concat([traj, reversed_traj], ignore_index=True)
+    # 六边形 cube 坐标: (locxo, locyo, loczo) ↔ (locxd, locyd, loczd)
+    reversed_traj = traj.copy()
+    for o_col, d_col in [('locxo', 'locxd'), ('locyo', 'locyd'), ('loczo', 'loczd')]:
+        if o_col in reversed_traj.columns and d_col in reversed_traj.columns:
+            reversed_traj[[o_col, d_col]] = reversed_traj[[d_col, o_col]].values
+    traj = pd.concat([traj, reversed_traj], ignore_index=True)
 
     shuffled_traj = traj.sample(frac=1, random_state=42).reset_index(drop=True)
 
@@ -343,7 +339,7 @@ if __name__ == "__main__":
     curriculum_mode = True
     USE_GNN = True
     FOV = 3
-    distance_threshold = 0.0
+    distance_threshold = 1.0
     env = PathEnv(train_mode=train_mode,
                   curriculum_mode=curriculum_mode,
                   mapdata=mapdata,
