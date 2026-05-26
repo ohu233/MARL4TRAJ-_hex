@@ -159,10 +159,10 @@ class PathEnv:
             'current_mode': self.selected_mode,
             'patch': (
                 get_hex_neighborhood(self.multi_mapdata, *hex_start, radius=self.FOV).tolist() +
-                self._patch_or_zero('TG', *hex_start).tolist() +
-                self._patch_or_zero('GG', *hex_start).tolist() +
                 self._patch_or_zero('GSD', *hex_start).tolist() +
-                self._patch_or_zero('TS', *hex_start).tolist()
+                self._patch_or_zero('GG', *hex_start).tolist() +
+                self._patch_or_zero('TS', *hex_start).tolist() +
+                self._patch_or_zero('TG', *hex_start).tolist()
             ),
             'visit_count': 0,
             'candidate_modes': set(),
@@ -288,14 +288,11 @@ class PathEnv:
             else:
                 reward -= 2
         else:
-            reward -= 2
+            reward -= 5
             if dist_change > 0:
                 reward += 1
             else:
-                reward -= 3
-
-        # 步数惩罚：鼓励尽快到达
-        reward -= 0.3
+                reward -= 5
 
         return reward
 
@@ -368,20 +365,20 @@ class PathEnv:
         )
         self.state['patch'] = (
             get_hex_neighborhood(self.multi_mapdata, *self.hex_start, radius=self.FOV).tolist() +
-            self._patch_or_zero('TG', *self.hex_start).tolist() +
-            self._patch_or_zero('GG', *self.hex_start).tolist() +
             self._patch_or_zero('GSD', *self.hex_start).tolist() +
-            self._patch_or_zero('TS', *self.hex_start).tolist()
+            self._patch_or_zero('GG', *self.hex_start).tolist() +
+            self._patch_or_zero('TS', *self.hex_start).tolist() +
+            self._patch_or_zero('TG', *self.hex_start).tolist()
         )
 
         # 判断 done
         if curr_dist <= self.distance_threshold:
             done = True
             success = 1
-            reward += 50
+            reward += 20
         elif self.step_cnt >= self.max_step:
             done = True
-            reward -= 20
+            reward -= 10
         else:
             done = False
 

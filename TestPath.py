@@ -16,7 +16,7 @@ TRAJ_CSV = 'data/artificial_od_all.csv'
 MODEL_PATH = "PathModel\sac_actor_ep5000_withGNN_withCurri.pth"
 SAVE_DIR = "TestPath_results"
 FOV = 3
-USE_GNN = True
+USE_GNN = False
 MAX_STEPS = 300
 SAVE_FIGURES = True
 

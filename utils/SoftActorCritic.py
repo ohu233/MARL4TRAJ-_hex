@@ -145,7 +145,7 @@ class StateEncoder(nn.Module):
         patch = x[:, self.vec_dim:]
 
         if self.use_gnn and self.patch_encoder is not None:
-            patch = patch.view(-1, self.n_cells, self.in_channels)
+            patch = patch.view(-1, self.in_channels, self.n_cells).transpose(1, 2).contiguous()
             patch_feat = self.patch_encoder(patch)
         else:
             patch_feat = patch

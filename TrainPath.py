@@ -131,6 +131,7 @@ def train_sac_on_pathenv(
         s = env.reset()
         s_vec = state_to_vector(s)
         ep_reward = 0.0
+        traj_list.append(env.hex_start)
 
         # 本回合 loss 累计
         ep_actor_losses = []
@@ -336,8 +337,8 @@ if __name__ == "__main__":
 
     # 课程学习开关
     train_mode = True
-    curriculum_mode = True
-    USE_GNN = True
+    curriculum_mode = False
+    USE_GNN = False
     FOV = 3
     distance_threshold = 1.0
     env = PathEnv(train_mode=train_mode,
