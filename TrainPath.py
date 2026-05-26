@@ -353,11 +353,11 @@ if __name__ == "__main__":
         metrics_window=100,
         min_stage_episodes=300,
         promote_reach_rate=85.0,
-        promote_match_rate=0.0,
+        promote_match_rate=60.0,
         promote_patience=3,
         min_refine_episodes=300,
         refine_reach_rate=85.0,
-        refine_match_rate=0.0,
+        refine_match_rate=60.0,
         refine_patience=4,
         prev_stage_mix_ratio=0.2,
     )

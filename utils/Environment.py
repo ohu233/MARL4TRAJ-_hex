@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 
 from utils.SoftActorCritic import DiscreteSACAgent, SACConfig
-from utils.tools import mapdata_to_modelmatrix, get_patch, state_to_vector, calculate_match_rate
+from utils.tools import mapdata_to_modelmatrix, state_to_vector, calculate_match_rate
 from utils.hex_utils import (
     HEX_DIRECTIONS, ACTION_TO_HEX_IDX,
     hex_distance, hex_is_valid, hex_add, hex_sub,
@@ -132,8 +132,8 @@ class PathEnv:
         self.multi_mapdata = {}
         for mode in self.selected_mode:
             mode_dict = self.mapdata[mode]
-            for cube, val in mode_dict.items():
-                self.multi_mapdata[cube] = self.multi_mapdata.get(cube, 0) + val
+            for cube in mode_dict:
+                self.multi_mapdata[cube] = 1
 
         # neighbor: 半径1六边形邻域
         self.neighbor = get_hex_neighborhood(
@@ -281,13 +281,21 @@ class PathEnv:
         dist_change = prev_dist - curr_dist
 
         # 接近目标就给正奖励，远离则惩罚
-        if dist_change > 0:
+        if is_on_road:
             reward += 2
+            if dist_change > 0:
+                reward += 2
+            else:
+                reward -= 2
         else:
-            reward -= 3
+            reward -= 2
+            if dist_change > 0:
+                reward += 1
+            else:
+                reward -= 3
 
         # 步数惩罚：鼓励尽快到达
-        reward -= 0.5
+        reward -= 0.3
 
         return reward
 
@@ -370,10 +378,10 @@ class PathEnv:
         if curr_dist <= self.distance_threshold:
             done = True
             success = 1
-            reward += 100
+            reward += 50
         elif self.step_cnt >= self.max_step:
             done = True
-            reward -= 50
+            reward -= 20
         else:
             done = False
 
