@@ -338,7 +338,7 @@ if __name__ == "__main__":
     train_mode = True
     curriculum_mode = True
     USE_GNN = True
-    FOV = 3
+    FOV = 5
     distance_threshold = 1.0
     env = PathEnv(train_mode=train_mode,
                   curriculum_mode=curriculum_mode,
@@ -362,4 +362,4 @@ if __name__ == "__main__":
         prev_stage_mix_ratio=0.2,
     )
 
-    agent, logs = train_sac_on_pathenv(env, episodes=7000, curriculum_cfg=curriculum_cfg, use_gnn=USE_GNN)
+    agent, logs = train_sac_on_pathenv(env, episodes=5000, curriculum_cfg=curriculum_cfg, use_gnn=USE_GNN)

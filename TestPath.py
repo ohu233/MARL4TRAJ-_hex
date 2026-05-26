@@ -15,7 +15,7 @@ from utils.hex_utils import hex_distance
 TRAJ_CSV = 'data/artificial_od_all.csv'
 MODEL_PATH = "PathModel\sac_actor_ep2000_withGNN_withCurri.pth"
 SAVE_DIR = "TestPath_results"
-FOV = 3
+FOV = 5
 USE_GNN = True
 MAX_STEPS = 300
 SAVE_FIGURES = True
@@ -24,7 +24,7 @@ SAVE_FIGURES = True
 # False: 保持环境原有随机 mode 采样
 USE_ROW_MODE_FROM_DATA = True
 
-MODE_COLORS = {"TG": "orange", "GG": "blue", "GSD": "green", "TS": "red"}
+MODE_COLORS = {"TG": "purple", "GG": "blue", "GSD": "green", "TS": "red"}
 
 # ============================================================
 # 高德地图瓦片底图
@@ -37,7 +37,7 @@ import pyproj
 
 _WGS84 = pyproj.CRS.from_epsg(4326)
 _MERC = pyproj.CRS.from_epsg(3857)
-_TRANSFORMER = pyproj.Transformer.from_crs(_WGS84, _MERC, always_xy=True)
+_TRANSFORMER_WGS84_TO_MERC = pyproj.Transformer.from_crs(_WGS84, _MERC, always_xy=True)
 
 AMAP_TILE_URL = (
     "https://webrd0{s}.is.autonavi.com/appmaptile"
@@ -47,29 +47,65 @@ AMAP_TILE_URL = (
 # hex→lonlat 缓存
 _hex_lonlat_cache = {}
 
+
+def _wgs84_to_gcj02(lon, lat):
+    """WGS84 → GCJ-02（火星坐标系），高德地图使用 GCJ-02。"""
+    a = 6378245.0       # 长半轴
+    ee = 0.00669342162296594323  # 偏心率平方
+
+    def _trans_lat(x, y):
+        ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
+        ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+        ret += (20.0 * math.sin(y * math.pi) + 40.0 * math.sin(y / 3.0 * math.pi)) * 2.0 / 3.0
+        ret += (160.0 * math.sin(y / 12.0 * math.pi) + 320.0 * math.sin(y * math.pi / 30.0)) * 2.0 / 3.0
+        return ret
+
+    def _trans_lon(x, y):
+        ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
+        ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+        ret += (20.0 * math.sin(x * math.pi) + 40.0 * math.sin(x / 3.0 * math.pi)) * 2.0 / 3.0
+        ret += (150.0 * math.sin(x / 12.0 * math.pi) + 300.0 * math.sin(x / 30.0 * math.pi)) * 2.0 / 3.0
+        return ret
+
+    dlat = _trans_lat(lon - 105.0, lat - 35.0)
+    dlon = _trans_lon(lon - 105.0, lat - 35.0)
+    radlat = lat / 180.0 * math.pi
+    magic = math.sin(radlat)
+    magic = 1 - ee * magic * magic
+    sqrtmagic = math.sqrt(magic)
+    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * sqrtmagic) * math.pi)
+    dlon = (dlon * 180.0) / (a / sqrtmagic * math.cos(radlat) * math.pi)
+    return lon + dlon, lat + dlat
+
+
 def build_hex_lonlat_index(hex_mapdata_raw):
-    """从 hex_grid.pkl 原始数据建立 {(q,r,s): (lon, lat)} 索引。"""
+    """从 hex_grid.pkl 原始数据建立 {(q,r,s): (lon, lat)} 索引（WGS84）。"""
     _hex_lonlat_cache.clear()
     for k, v in hex_mapdata_raw.items():
         _hex_lonlat_cache[tuple(int(c) for c in k)] = (v['lon'], v['lat'])
+
 
 def hex_to_lonlat(q, r, s):
     """cube 坐标 → WGS84 (lon, lat)，找不到则返回 None。"""
     key = (int(round(q)), int(round(r)), int(round(s)))
     return _hex_lonlat_cache.get(key)
 
+
 def hex_to_mercator(q, r, s):
-    """cube 坐标 → Web Mercator (mx, my)。"""
+    """cube 坐标 → Web Mercator (mx, my)，经 GCJ-02 纠偏以对齐高德底图。"""
     ll = hex_to_lonlat(q, r, s)
     if ll is None:
         return None
-    mx, my = _TRANSFORMER.transform(ll[0], ll[1])
+    gcj_lon, gcj_lat = _wgs84_to_gcj02(ll[0], ll[1])
+    mx, my = _TRANSFORMER_WGS84_TO_MERC.transform(gcj_lon, gcj_lat)
     return mx, my
 
+
 def lonlat_to_tile(lon, lat, zoom):
-    """WGS84 → 高德瓦片 (tx, ty)。"""
-    tx = int((lon + 180) / 360 * (1 << zoom))
-    lat_rad = math.radians(lat)
+    """WGS84 → 高德瓦片 (tx, ty)，内部转 GCJ-02。"""
+    gcj_lon, gcj_lat = _wgs84_to_gcj02(lon, lat)
+    tx = int((gcj_lon + 180) / 360 * (1 << zoom))
+    lat_rad = math.radians(gcj_lat)
     ty = int((1 - math.asinh(math.tan(lat_rad)) / math.pi) / 2 * (1 << zoom))
     return tx, ty
 
@@ -150,8 +186,8 @@ def _get_zoom_for_bounds(xmin, xmax, ymin, ymax, fig_width_px=600):
 
 
 def plot_trajectory(traj_hex, hex_end, mode_str, selected_mode, save_path,
-                    success_flag, match_rate, trans_count):
-    """绘制单条 hex 轨迹，高德瓦片底图。"""
+                    success_flag, match_rate, trans_count, mapdata=None):
+    """绘制单条 hex 轨迹，高德瓦片底图 + 路网叠加。"""
     # hex → mercator
     mxs, mys = [], []
     for p in traj_hex:
@@ -175,6 +211,27 @@ def plot_trajectory(traj_hex, hex_end, mode_str, selected_mode, save_path,
     zoom = _get_zoom_for_bounds(*merc_bounds)
     add_amap_basemap(ax, merc_bounds, zoom=zoom)
 
+    # 叠加路网（半透明方块）
+    if mapdata is not None:
+        sel_modes = selected_mode.split('+')
+        xmin, xmax, ymin, ymax = merc_bounds
+        for mode_name in sel_modes:
+            if mode_name not in mapdata:
+                continue
+            road_hexes = []
+            for cube, val in mapdata[mode_name].items():
+                if val == 1:
+                    m = hex_to_mercator(cube[0], cube[1], cube[2])
+                    if m is not None:
+                        if xmin <= m[0] <= xmax and ymin <= m[1] <= ymax:
+                            road_hexes.append(m)
+            if road_hexes:
+                rx = [r[0] for r in road_hexes]
+                ry = [r[1] for r in road_hexes]
+                ax.scatter(rx, ry, s=1.5, c=MODE_COLORS.get(mode_name, 'gray'),
+                           marker='s', alpha=0.35, zorder=2,
+                           label=f'road_{mode_name}')
+
     ax.plot(mxs, mys, marker='o', markersize=3, color=color,
             linewidth=2, alpha=0.9, zorder=4)
     ax.scatter(mxs[0], mys[0], c=color, marker='o', s=100,
@@ -195,8 +252,8 @@ def plot_trajectory(traj_hex, hex_end, mode_str, selected_mode, save_path,
     plt.close(fig)
 
 
-def plot_combined_for_id(items, tid, save_dir):
-    """为单个 ID 生成轨迹聚合图，高德瓦片底图。"""
+def plot_combined_for_id(items, tid, save_dir, mapdata=None):
+    """为单个 ID 生成轨迹聚合图，高德瓦片底图 + 路网叠加。"""
     combined_dir = os.path.join(save_dir, "combined_by_id")
     os.makedirs(combined_dir, exist_ok=True)
 
@@ -206,6 +263,32 @@ def plot_combined_for_id(items, tid, save_dir):
     fig, ax = plt.subplots(figsize=(10, 9))
     zoom = _get_zoom_for_bounds(*merc_bounds)
     add_amap_basemap(ax, merc_bounds, zoom=zoom)
+
+    # 收集所有出现过的 selected_mode 并叠加路网
+    if mapdata is not None:
+        all_modes = set()
+        for item in items:
+            for m in item.get("selected_mode", "").split("+"):
+                m = m.strip()
+                if m:
+                    all_modes.add(m)
+        xmin, xmax, ymin, ymax = merc_bounds
+        for mode_name in sorted(all_modes):
+            if mode_name not in mapdata:
+                continue
+            road_hexes = []
+            for cube, val in mapdata[mode_name].items():
+                if val == 1:
+                    m = hex_to_mercator(cube[0], cube[1], cube[2])
+                    if m is not None:
+                        if xmin <= m[0] <= xmax and ymin <= m[1] <= ymax:
+                            road_hexes.append(m)
+            if road_hexes:
+                rx = [r[0] for r in road_hexes]
+                ry = [r[1] for r in road_hexes]
+                ax.scatter(rx, ry, s=1.5, c=MODE_COLORS.get(mode_name, 'gray'),
+                           marker='s', alpha=0.35, zorder=2,
+                           label=f'road_{mode_name}')
 
     prev_end = None
     for item in items:
@@ -303,7 +386,8 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str):
 
     def _flush_id_buffer():
         if id_buffer and current_id is not None:
-            plot_combined_for_id(id_buffer, current_id, save_dir)
+            plot_combined_for_id(id_buffer, current_id, save_dir,
+                                mapdata=env.mapdata)
             id_buffer.clear()
 
     for ep in range(episodes):
@@ -350,11 +434,12 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str):
         match_list.append(match_rate)
         trans_list.append(env.min_trans_count)
 
+        selected_mode_str = "+".join(env.selected_mode)
         records.append({
             "episode": ep,
             "ID": row_id,
             "real_mode": real_mode,
-            "selected_mode": "+".join(env.selected_mode),
+            "selected_mode": selected_mode_str,
             "reward": float(total_reward),
             "success": success_flag,
             "match_rate": float(match_rate),
@@ -376,10 +461,11 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str):
             fname = (f"{row_id}_{ep:04d}_succ{success_flag}"
                      f"_match{match_rate:.2f}.png")
             plot_trajectory(traj, hex_end, real_mode,
-                            "+".join(env.selected_mode),
+                            selected_mode_str,
                             os.path.join(ep_dir, fname),
                             success_flag, match_rate,
-                            env.min_trans_count)
+                            env.min_trans_count,
+                            mapdata=env.mapdata)
 
         if (ep + 1) % 100 == 0:
             print(f"[{ep+1}/{episodes}] "
