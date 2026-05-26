@@ -179,13 +179,16 @@ class PathEnv:
         return self.state
 
     def _read_hex_coords(self, row):
-        """从 CSV 行中读取 hex cube 坐标。"""
+        """从 CSV 行中读取 hex cube 坐标。
+        CSV 的 loczo/loczd 由三个分量独立 round 生成，可能违反 q+r+s=0。
+        这里用 q/r 重新推导 s，与 hex_grid.pkl 保持一致。
+        """
         locxo = float(row['locxo'])
         locyo = float(row['locyo'])
-        loczo = float(row['loczo'])
         locxd = float(row['locxd'])
         locyd = float(row['locyd'])
-        loczd = float(row['loczd'])
+        loczo = -(locxo + locyo)
+        loczd = -(locxd + locyd)
 
         return (locxo, locyo, loczo), (locxd, locyd, loczd)
 
@@ -281,13 +284,7 @@ class PathEnv:
         if dist_change > 0:
             reward += 2
         else:
-            reward -= 0.5
-
-        # 在路上额外加分
-        if is_on_road:
-            reward += 1
-        else:
-            reward -= 0.5
+            reward -= 3
 
         # 步数惩罚：鼓励尽快到达
         reward -= 0.5
@@ -326,7 +323,7 @@ class PathEnv:
 
         visit_count = self.node_memory.get(pos_key)
         self.state['visit_count'] = visit_count
-        reward -= min(visit_count * 2, 2)
+        # reward -= min(visit_count * 2, 2)
 
         # 更新绝对坐标
         self.hex_start = hex_add(self.hex_start, HEX_DIRECTIONS[action])
@@ -338,7 +335,7 @@ class PathEnv:
         new_candidate = self.candidate_modes & curr_active_modes
         if (self.candidate_modes or curr_active_modes) and len(new_candidate) == 0:
             self.min_trans_count += 1
-            reward -= 1
+            # reward -= 1
             self.candidate_modes = curr_active_modes.copy()
         else:
             self.candidate_modes = new_candidate
@@ -373,10 +370,10 @@ class PathEnv:
         if curr_dist <= self.distance_threshold:
             done = True
             success = 1
-            reward += 50
+            reward += 100
         elif self.step_cnt >= self.max_step:
             done = True
-            reward -= 5
+            reward -= 50
         else:
             done = False
 

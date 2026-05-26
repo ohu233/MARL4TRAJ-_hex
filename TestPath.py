@@ -13,9 +13,9 @@ from utils.hex_utils import hex_distance
 
 # ========== 配置 ==========
 TRAJ_CSV = 'data/artificial_od_all.csv'
-MODEL_PATH = "PathModel\sac_actor_ep2000_withGNN_withCurri.pth"
+MODEL_PATH = "PathModel\sac_actor_ep3000_withGNN_withCurri.pth"
 SAVE_DIR = "TestPath_results"
-FOV = 5
+FOV = 3
 USE_GNN = True
 MAX_STEPS = 300
 SAVE_FIGURES = True
@@ -190,15 +190,30 @@ def plot_trajectory(traj_hex, hex_end, mode_str, selected_mode, save_path,
     """绘制单条 hex 轨迹，高德瓦片底图 + 路网叠加。"""
     # hex → mercator
     mxs, mys = [], []
+    unmappable_count = 0
     for p in traj_hex:
         merc = hex_to_mercator(p[0], p[1], p[2])
         if merc is not None:
             mxs.append(merc[0])
             mys.append(merc[1])
+        else:
+            unmappable_count += 1
     end_merc = hex_to_mercator(hex_end[0], hex_end[1], hex_end[2])
 
+    if unmappable_count > 0:
+        print(f"[WARN] {unmappable_count}/{len(traj_hex)} trajectory points "
+              f"outside hex_grid coverage, file={save_path}")
+
     if not mxs:
-        return
+        # 尝试用起点坐标确定范围
+        p0 = traj_hex[0]
+        merc0 = hex_to_mercator(p0[0], p0[1], p0[2])
+        if merc0 is None:
+            # 连起点都无法映射，跳过
+            print(f"[SKIP] All trajectory points unmappable, "
+                  f"no PNG generated: {save_path}")
+            return
+        mxs, mys = [merc0[0]], [merc0[1]]
 
     padding = 300
     merc_bounds = (min(mxs) - padding, max(mxs) + padding,
@@ -394,7 +409,8 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str):
         row = traj_df.iloc[ep]
         row_id = str(row['ID'])
         real_mode = str(row['mode']).strip()
-        hex_end = (float(row['locxd']), float(row['locyd']), float(row['loczd']))
+        hex_end = (float(row['locxd']), float(row['locyd']),
+                   -(float(row['locxd']) + float(row['locyd'])))
 
         if current_id is not None and row_id != current_id:
             _flush_id_buffer()
