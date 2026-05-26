@@ -227,29 +227,32 @@ class PathEnv:
         key = (int(round(q)), int(round(r)), int(round(s)))
         return self.mapdata[mode].get(key, 0)
 
-    def split_traj_by_distance(self, num_stages: int = 4):
+    def split_traj_by_distance(self, distance_bins: list = None):
+        """
+        按距离阈值分段（用于课程学习）。
+
+        distance_bins: 距离分段边界，如 [0, 4, 8, 12, 100] 分 4 段。
+                       默认 None → 不分段，返回全部数据。
+        """
         if self.traj is None or len(self.traj) == 0:
             return [self.traj]
 
+        if distance_bins is None or len(distance_bins) < 2:
+            return [self.traj.copy().reset_index(drop=True)]
+
         required_cols = {'locxo', 'locyo', 'loczo', 'locxd', 'locyd', 'loczd'}
-
-        df = self.traj.copy().reset_index(drop=True)
-
-        if required_cols.issubset(df.columns):
-            df['_dist'] = df.apply(
-                lambda r: hex_distance(
-                    (r['locxo'], r['locyo'], r['loczo']),
-                    (r['locxd'], r['locyd'], r['loczd']),
-                ), axis=1
-            )
-        else:
+        if not required_cols.issubset(self.traj.columns):
             raise ValueError(f"Trajectory dataframe missing required columns: {required_cols}")
 
-        bins = min(num_stages, max(1, int(df['_dist'].nunique())))
-        if bins == 1:
-            return [df.drop(columns=['_dist']).reset_index(drop=True)]
+        df = self.traj.copy().reset_index(drop=True)
+        df['_dist'] = df.apply(
+            lambda r: hex_distance(
+                (r['locxo'], r['locyo'], r['loczo']),
+                (r['locxd'], r['locyd'], r['loczd']),
+            ), axis=1
+        )
 
-        sid = pd.qcut(df['_dist'], q=bins, labels=False, duplicates='drop')
+        sid = pd.cut(df['_dist'], bins=distance_bins, labels=False, include_lowest=True)
         df['_sid'] = sid.astype(int)
 
         stage_trajs = []
@@ -284,15 +287,15 @@ class PathEnv:
         if is_on_road:
             reward += 2
             if dist_change > 0:
-                reward += 2
+                reward += 1
             else:
                 reward -= 2
         else:
-            reward -= 5
+            reward -= 2
             if dist_change > 0:
                 reward += 1
             else:
-                reward -= 5
+                reward -= 2
 
         return reward
 

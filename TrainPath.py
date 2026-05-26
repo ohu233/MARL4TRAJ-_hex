@@ -19,7 +19,7 @@ from utils.SoftActorCritic import ReplayBuffer, MLP, SACConfig, DiscreteSACAgent
 
 @dataclass
 class CurriculumConfig:
-    num_stages: int = 4
+    distance_bins: list = None  # [0, 4, 8, 12, 100] → 4 段；None → 不分段
     metrics_window: int = 100
     min_stage_episodes: int = 300
     promote_reach_rate: float = 85
@@ -53,7 +53,7 @@ def train_sac_on_pathenv(
     agent = DiscreteSACAgent(vec_dim=20, hex_radius=env.FOV, action_dim=action_dim,
                               cfg=cfg, use_gnn=use_gnn, in_channels=5)
 
-    stage_trajs = env.split_traj_by_distance(curriculum_cfg.num_stages)
+    stage_trajs = env.split_traj_by_distance(curriculum_cfg.distance_bins)
     stage_idx = 0
     env.set_curriculum_stage(stage_idx, stage_trajs[stage_idx], max_mode_count=4)
     env.set_mode_sampling_range(min_mode_count=1, max_mode_count=4)
@@ -333,13 +333,13 @@ if __name__ == "__main__":
             reversed_traj[[o_col, d_col]] = reversed_traj[[d_col, o_col]].values
     traj = pd.concat([traj, reversed_traj], ignore_index=True)
 
-    shuffled_traj = traj.sample(frac=1, random_state=42).reset_index(drop=True)
+    shuffled_traj = traj.sample(frac=1, random_state=40).reset_index(drop=True)
 
     # 课程学习开关
     train_mode = True
     curriculum_mode = False
-    USE_GNN = False
-    FOV = 3
+    USE_GNN = True
+    FOV = 5
     distance_threshold = 1.0
     env = PathEnv(train_mode=train_mode,
                   curriculum_mode=curriculum_mode,
@@ -350,15 +350,15 @@ if __name__ == "__main__":
                   )
 
     curriculum_cfg = CurriculumConfig(
-        num_stages=4 if curriculum_mode else 1,  # 非课程学习时需要把该参数调整为1 否则为4
+        distance_bins=[0, 6, 12, 28, 100] if curriculum_mode else None,
         metrics_window=100,
         min_stage_episodes=300,
-        promote_reach_rate=85.0,
-        promote_match_rate=60.0,
+        promote_reach_rate=80.0,
+        promote_match_rate=80.0,
         promote_patience=3,
         min_refine_episodes=300,
-        refine_reach_rate=85.0,
-        refine_match_rate=60.0,
+        refine_reach_rate=80.0,
+        refine_match_rate=80.0,
         refine_patience=4,
         prev_stage_mix_ratio=0.2,
     )

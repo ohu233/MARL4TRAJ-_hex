@@ -15,14 +15,14 @@ from utils.hex_utils import hex_distance
 TRAJ_CSV = 'data/artificial_od_all.csv'
 MODEL_PATH = "PathModel\sac_actor_ep5000_withGNN_withCurri.pth"
 SAVE_DIR = "TestPath_results"
-FOV = 3
-USE_GNN = False
+FOV = 5
+USE_GNN = True
 MAX_STEPS = 300
 SAVE_FIGURES = True
 
 # True: 测试时使用 row['mode'] 作为唯一选中模式
 # False: 保持环境原有随机 mode 采样
-USE_ROW_MODE_FROM_DATA = True
+USE_ROW_MODE_FROM_DATA = False
 
 MODE_COLORS = {"TG": "purple", "GG": "blue", "GSD": "green", "TS": "red"}
 
