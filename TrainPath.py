@@ -354,13 +354,13 @@ if __name__ == "__main__":
         metrics_window=100,
         min_stage_episodes=300,
         promote_reach_rate=80.0,
-        promote_match_rate=80.0,
+        promote_match_rate=70.0,
         promote_patience=3,
         min_refine_episodes=300,
         refine_reach_rate=80.0,
-        refine_match_rate=80.0,
+        refine_match_rate=70.0,
         refine_patience=4,
         prev_stage_mix_ratio=0.2,
     )
 
-    agent, logs = train_sac_on_pathenv(env, episodes=5000, curriculum_cfg=curriculum_cfg, use_gnn=USE_GNN)
+    agent, logs = train_sac_on_pathenv(env, episodes=25000, curriculum_cfg=curriculum_cfg, use_gnn=USE_GNN)

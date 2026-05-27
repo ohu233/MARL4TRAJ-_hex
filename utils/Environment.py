@@ -141,7 +141,7 @@ class PathEnv:
         )
 
         h_dist = hex_distance(hex_start, hex_end)
-        self.max_step = max(1, int(h_dist * 3))
+        self.max_step = max(1, int(h_dist * 1.5))
 
         self.traj_cnt += 1
 
@@ -277,25 +277,22 @@ class PathEnv:
 
     def calculate_reward(self, reward, prev_dist, curr_dist, neighbor, action):
         '''
-        改进后的奖励函数（hex 版本）。
+        基于距离变化的比例奖励（hex 版本）。
+        接近目标的跨度越大奖励越高，远离则惩罚。
         neighbor: 半径1六边形邻域 [center, dir0(北), dir1(西北), dir2(西南), dir3(南), dir4(东南), dir5(东北)]
         '''
         is_on_road = neighbor[ACTION_TO_HEX_IDX[action]] != 0
         dist_change = prev_dist - curr_dist
 
-        # 接近目标就给正奖励，远离则惩罚
+        if dist_change > 0:
+            reward += 2 + dist_change * 0.5
+        else:
+            reward -= 1 + abs(dist_change) * 0.3
+
         if is_on_road:
-            reward += 2
-            if dist_change > 0:
-                reward += 1
-            else:
-                reward -= 2
+            reward += 1
         else:
             reward -= 2
-            if dist_change > 0:
-                reward += 1
-            else:
-                reward -= 2
 
         return reward
 
@@ -378,7 +375,7 @@ class PathEnv:
         if curr_dist <= self.distance_threshold:
             done = True
             success = 1
-            reward += 20
+            reward += 30
         elif self.step_cnt >= self.max_step:
             done = True
             reward -= 10

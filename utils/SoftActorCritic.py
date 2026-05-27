@@ -64,13 +64,17 @@ class HexPatchEncoder(nn.Module):
     def forward(self, x):
         """
         x: (B, N, in_channels) 节点特征
-        返回: (B, 6 * out_dim) — 6 个方向各自的特征
+        返回: (B, 8 * out_dim) — 中心 + 6方向 + 全局池化
         """
         for conv in self.convs:
             x = F.relu(conv(x, self.a_hat))
-        # 提取 ring-1 的 6 个方向节点 (indices 1-6)
-        ring1 = x[:, 1:7, :]                    # (B, 6, out_dim)
-        return ring1.reshape(x.size(0), -1)      # (B, 6 * out_dim)
+
+        center = x[:, 0:1, :]                     # (B, 1, out_dim) 中心节点
+        ring1 = x[:, 1:7, :]                      # (B, 6, out_dim) ring-1
+        global_pool = x.mean(dim=1, keepdim=True) # (B, 1, out_dim) 全局平均
+
+        combined = torch.cat([center, ring1, global_pool], dim=1)  # (B, 8, out_dim)
+        return combined.reshape(x.size(0), -1)    # (B, 8 * out_dim)
 
 
 # ============================================================
@@ -136,7 +140,7 @@ class StateEncoder(nn.Module):
                 in_channels=in_channels, hidden_dim=32, out_dim=64,
                 n_nodes=self.n_cells,
             )
-            self.out_dim = vec_dim + 6 * 64
+            self.out_dim = vec_dim + 8 * 64  # center + ring1(6) + global_pool
         else:
             self.patch_encoder = None
             self.out_dim = vec_dim + in_channels * self.n_cells
