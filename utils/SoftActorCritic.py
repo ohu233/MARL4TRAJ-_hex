@@ -42,6 +42,8 @@ class HexPatchEncoder(nn.Module):
         self.in_channels = in_channels
         self.out_dim = out_dim
         self.n_nodes = n_nodes
+        self.radius = int((np.sqrt(12 * n_nodes - 3) - 3) / 6)
+        self.num_vectors = self.radius + 7 if self.radius >= 1 else 2
 
         layers = []
         cur_dim = in_channels
@@ -52,7 +54,7 @@ class HexPatchEncoder(nn.Module):
         self.convs = nn.ModuleList(layers)
 
         # 注册固定邻接矩阵（不参与训练）
-        edge_index = get_fixed_edge_index(int((np.sqrt(12 * n_nodes - 3) - 3) / 6))
+        edge_index = get_fixed_edge_index(self.radius)
         a = torch.zeros(n_nodes, n_nodes)
         a[edge_index[0], edge_index[1]] = 1.0
         a = a + torch.eye(n_nodes)  # 加自环
@@ -64,17 +66,25 @@ class HexPatchEncoder(nn.Module):
     def forward(self, x):
         """
         x: (B, N, in_channels) 节点特征
-        返回: (B, 8 * out_dim) — 中心 + 6方向 + 全局池化
+        返回: (B, num_vectors * out_dim)
+          ring0 + ring1(6cells) + ring2..R(各1 mean) + global
         """
         for conv in self.convs:
             x = F.relu(conv(x, self.a_hat))
 
-        center = x[:, 0:1, :]                     # (B, 1, out_dim) 中心节点
-        ring1 = x[:, 1:7, :]                      # (B, 6, out_dim) ring-1
-        global_pool = x.mean(dim=1, keepdim=True) # (B, 1, out_dim) 全局平均
+        pooled = [x[:, 0:1, :]]   # ring0: center
+        pooled.append(x[:, 1:7, :])  # ring1: 保留 6 个 cell（方向信息）
 
-        combined = torch.cat([center, ring1, global_pool], dim=1)  # (B, 8, out_dim)
-        return combined.reshape(x.size(0), -1)    # (B, 8 * out_dim)
+        idx = 7
+        for r in range(2, self.radius + 1):
+            n = 6 * r
+            pooled.append(x[:, idx:idx + n, :].mean(dim=1, keepdim=True))
+            idx += n
+
+        pooled.append(x.mean(dim=1, keepdim=True))  # global pool
+
+        combined = torch.cat(pooled, dim=1)
+        return combined.reshape(x.size(0), -1)
 
 
 # ============================================================
@@ -140,7 +150,7 @@ class StateEncoder(nn.Module):
                 in_channels=in_channels, hidden_dim=32, out_dim=64,
                 n_nodes=self.n_cells,
             )
-            self.out_dim = vec_dim + 8 * 64  # center + ring1(6) + global_pool
+            self.out_dim = vec_dim + self.patch_encoder.num_vectors * 64
         else:
             self.patch_encoder = None
             self.out_dim = vec_dim + in_channels * self.n_cells

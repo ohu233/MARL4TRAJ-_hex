@@ -22,7 +22,7 @@ SAVE_FIGURES = True
 
 # True: 测试时使用 row['mode'] 作为唯一选中模式
 # False: 保持环境原有随机 mode 采样
-USE_ROW_MODE_FROM_DATA = False
+USE_ROW_MODE_FROM_DATA = True
 
 MODE_COLORS = {"TG": "purple", "GG": "blue", "GSD": "green", "TS": "red"}
 
