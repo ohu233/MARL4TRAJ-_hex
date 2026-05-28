@@ -323,7 +323,7 @@ if __name__ == "__main__":
     from utils.hex_utils import load_hex_mapdata_raw
 
     mapdata = load_hex_mapdata_raw('data/hex_grid.pkl')
-    traj = pd.read_csv('data//artificial_od_all.csv')
+    traj = pd.read_csv('data//artificial_od_single.csv')
 
     # 对调换起点和终点进行训练，增加数据多样性
     # 六边形 cube 坐标: (locxo, locyo, loczo) ↔ (locxd, locyd, loczd)

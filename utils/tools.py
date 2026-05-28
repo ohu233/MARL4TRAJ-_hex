@@ -45,11 +45,11 @@ def mapdata_to_modelmatrix(mapdata: Union[dict, Dict], *args, **kwargs):
     }
     for k, v in mapdata.items():
         try:
-            if v[4] & 1 == 1 or v[4] >> 1 & 1 == 1:
+            if v[4] >> 6 & 1 == 1:
                 modelmatrix['TG'][k[0]][k[1]] = 1
-            if v[4] & 1 == 1 or v[4] >> 6 & 1 == 1 or v[4] >> 1 & 1 == 1:
+            if v[4] >> 1 & 1 == 1:
                 modelmatrix['TS'][k[0]][k[1]] = 1
-            if v[4] >> 3 & 1 == 1:
+            if v[4] >> 3 & 1 == 1 or v[4] >> 4 & 1 == 1:
                 modelmatrix['GG'][k[0]][k[1]] = 1
             if v[4] >> 2 & 1 == 1 or v[4] >> 5 & 1 == 1:
                 modelmatrix['GSD'][k[0]][k[1]] = 1

@@ -220,20 +220,20 @@ def code_to_mode_matrices(hex_mapdata):
     """
     将 {cube → code} 位掩码转为 {mode_name: {cube → 0/1}}。
 
-    位掩码逻辑与 tools.mapdata_to_modelmatrix 一致:
-      TG:  code&1==1 or code>>1&1==1     (bits 0, 1)
-      TS:  code&1==1 or code>>6&1==1 or code>>1&1==1  (bits 0, 1, 6)
-      GG:  code>>3&1==1                  (bit 3)
-      GSD: code>>2&1==1 or code>>5&1==1  (bits 2, 5)
+    位掩码: 县道(xd),普铁(pt),省道(sd),高速收费站(gs_sfz),高速(gs),国道(gd),高铁(gt),火车站(hcz)
+      TG:  code>>6&1==1           (bit 6: 高铁 gt)
+      TS:  code>>1&1==1           (bit 1: 普铁 pt)
+      GG:  code>>3&1==1 or code>>4&1==1  (bits 3,4: 高速收费站+高速)
+      GSD: code>>2&1==1 or code>>5&1==1  (bits 2,5: 省道+国道)
     """
     mode_matrices = {m: {} for m in MODE_LIST}
 
     for cube, code in hex_mapdata.items():
-        if code & 1 == 1 or (code >> 1) & 1 == 1:
+        if (code >> 6) & 1 == 1:
             mode_matrices['TG'][cube] = 1
-        if code & 1 == 1 or (code >> 6) & 1 == 1 or (code >> 1) & 1 == 1:
+        if (code >> 1) & 1 == 1:
             mode_matrices['TS'][cube] = 1
-        if (code >> 3) & 1 == 1:
+        if (code >> 3) & 1 == 1 or (code >> 4) & 1 == 1:
             mode_matrices['GG'][cube] = 1
         if (code >> 2) & 1 == 1 or (code >> 5) & 1 == 1:
             mode_matrices['GSD'][cube] = 1

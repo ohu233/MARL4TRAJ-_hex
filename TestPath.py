@@ -12,7 +12,7 @@ from utils.tools import state_to_vector, calculate_match_rate
 from utils.hex_utils import hex_distance
 
 # ========== 配置 ==========
-TRAJ_CSV = 'data/artificial_od_all.csv'
+TRAJ_CSV = 'data/artificial_od_test.csv'
 MODEL_PATH = "PathModel\sac_actor_ep5000_withGNN.pth"
 SAVE_DIR = "TestPath_results"
 FOV = 5
@@ -249,13 +249,13 @@ def plot_trajectory(traj_hex, hex_end, mode_str, selected_mode, save_path,
 
     ax.plot(mxs, mys, marker='o', markersize=3, color=color,
             linewidth=2, alpha=0.9, zorder=4)
-    ax.scatter(mxs[0], mys[0], c=color, marker='o', s=100,
-               edgecolors='red', linewidths=2, zorder=6, label='start')
+    ax.scatter(mxs[0], mys[0], c=color, marker='o', s=50,
+               edgecolors='red', linewidths=1.5, zorder=6, label='start')
     if end_merc is not None:
-        ax.scatter(end_merc[0], end_merc[1], c=color, marker='X', s=120,
-                   edgecolors='black', linewidths=1.5, zorder=6, label='goal')
-    ax.scatter(mxs[-1], mys[-1], c='black', marker='^', s=80,
-               linewidths=1.5, zorder=6, label='agent_end')
+        ax.scatter(end_merc[0], end_merc[1], c=color, marker='X', s=60,
+                   edgecolors='black', linewidths=1, zorder=6, label='goal')
+    ax.scatter(mxs[-1], mys[-1], c='black', marker='^', s=40,
+               linewidths=1, zorder=6, label='agent_end')
 
     ax.set_title(f"Mode={mode_str}, Sel={selected_mode}, "
                  f"Succ={success_flag}, Match={match_rate:.2f}, Trans={trans_count}")
@@ -320,8 +320,8 @@ def plot_combined_for_id(items, tid, save_dir, mapdata=None):
                 linewidth=1.5, alpha=0.8, zorder=4)
 
         if mxs:
-            ax.scatter(mxs[0], mys[0], c=color, marker='o', s=60, zorder=5)
-            ax.scatter(mxs[-1], mys[-1], c=color, marker='x', s=60, zorder=5)
+            ax.scatter(mxs[0], mys[0], c=color, marker='o', s=30, zorder=5)
+            ax.scatter(mxs[-1], mys[-1], c=color, marker='x', s=30, zorder=5)
 
         if prev_end is not None:
             pe = hex_to_mercator(prev_end[0], prev_end[1], prev_end[2])
@@ -341,11 +341,11 @@ def plot_combined_for_id(items, tid, save_dir, mapdata=None):
                           last["end_hex"][2])
     if fs is not None:
         ax.scatter(fs[0], fs[1], c=MODE_COLORS.get(first["mode"], "C0"),
-                   marker='o', s=140, edgecolors='red', linewidths=2,
+                   marker='o', s=70, edgecolors='red', linewidths=1.5,
                    zorder=6, label='start')
     if le is not None:
         ax.scatter(le[0], le[1], c=MODE_COLORS.get(last["mode"], "C0"),
-                   marker='X', s=160, edgecolors='black', linewidths=2,
+                   marker='X', s=80, edgecolors='black', linewidths=1.5,
                    zorder=6, label='end')
 
     ax.set_title(f"ID={tid}, segments={len(items)}")
