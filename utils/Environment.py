@@ -40,7 +40,7 @@ class PathEnv:
                  curriculum_mode: bool = True,
                  mapdata: dict = None,
                  traj: pd.DataFrame = None,
-                 FOV: int = 3,
+                 FOV: int = 1,
                  distance_threshold: float = 1.0,
                  ):
 
@@ -288,6 +288,12 @@ class PathEnv:
             reward += 1
         else:
             reward -= 1
+        
+        if is_on_road:
+            reward += 1
+        else:
+            reward -= 1.5
+
         return reward
 
     def step(self, action: int):
