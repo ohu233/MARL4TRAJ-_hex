@@ -12,7 +12,7 @@ from utils.tools import state_to_vector, calculate_match_rate
 from utils.hex_utils import hex_distance
 
 # ========== 配置 ==========
-TRAJ_CSV = 'data/artificial_od_test.csv'
+TRAJ_CSV = 'data/artificial_od_single.csv'
 MODEL_PATH = "PathModel\sac_actor_ep5000_withGNN.pth"
 SAVE_DIR = "TestPath_results"
 FOV = 5

@@ -141,7 +141,7 @@ class PathEnv:
         )
 
         h_dist = hex_distance(hex_start, hex_end)
-        self.max_step = max(1, int(h_dist * 1.5))
+        self.max_step = max(1, int(h_dist * 3))
 
         self.traj_cnt += 1
 
@@ -285,15 +285,9 @@ class PathEnv:
         dist_change = prev_dist - curr_dist
 
         if dist_change > 0:
-            reward += 2 + dist_change * 0.5
-        else:
-            reward -= 1 + abs(dist_change) * 0.3
-
-        if is_on_road:
             reward += 1
         else:
-            reward -= 2
-
+            reward -= 1
         return reward
 
     def step(self, action: int):
@@ -375,10 +369,10 @@ class PathEnv:
         if curr_dist <= self.distance_threshold:
             done = True
             success = 1
-            reward += 30
+            reward += 50
         elif self.step_cnt >= self.max_step:
             done = True
-            reward -= 10
+            reward -= 30
         else:
             done = False
 
