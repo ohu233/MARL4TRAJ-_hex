@@ -19,7 +19,7 @@ from utils.SoftActorCritic import ReplayBuffer, MLP, SACConfig, DiscreteSACAgent
 
 @dataclass
 class CurriculumConfig:
-    distance_bins: list = None  # [0, 4, 8, 12, 100] → 4 段；None → 不分段
+    distance_bins: int = None  # int → qcut 均分 N 段；list → cut 固定边界；None → 不分段
     metrics_window: int = 100
     min_stage_episodes: int = 300
     promote_reach_rate: float = 85
@@ -338,8 +338,8 @@ if __name__ == "__main__":
     # 课程学习开关
     train_mode = True
     curriculum_mode = False
-    USE_GNN = True
-    FOV = 2
+    USE_GNN = False
+    FOV = 3
     distance_threshold = 1.0
     env = PathEnv(train_mode=train_mode,
                   curriculum_mode=curriculum_mode,
@@ -350,17 +350,17 @@ if __name__ == "__main__":
                   )
 
     curriculum_cfg = CurriculumConfig(
-        distance_bins=[0, 6, 12, 28, 100] if curriculum_mode else None,
+        distance_bins=4 if curriculum_mode else None,
         metrics_window=100,
         min_stage_episodes=300,
         promote_reach_rate=85.0,
-        promote_match_rate=0.0,
-        promote_patience=3,
+        promote_match_rate=80.0,
+        promote_patience=10,
         min_refine_episodes=300,
         refine_reach_rate=85.0,
-        refine_match_rate=0.0,
+        refine_match_rate=80.0,
         refine_patience=4,
-        prev_stage_mix_ratio=0.2,
+        prev_stage_mix_ratio=0.4,
     )
 
-    agent, logs = train_sac_on_pathenv(env, episodes=5000, curriculum_cfg=curriculum_cfg, use_gnn=USE_GNN)
+    agent, logs = train_sac_on_pathenv(env, episodes=25000, curriculum_cfg=curriculum_cfg, use_gnn=USE_GNN)

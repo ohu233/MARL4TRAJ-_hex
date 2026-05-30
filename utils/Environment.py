@@ -175,6 +175,7 @@ class PathEnv:
         self.candidate_modes = start_modes.copy()
         self.state['candidate_modes'] = self.candidate_modes
         self.min_trans_count = 0
+        self.on_road_steps = 0
 
         return self.state
 
@@ -227,17 +228,19 @@ class PathEnv:
         key = (int(round(q)), int(round(r)), int(round(s)))
         return self.mapdata[mode].get(key, 0)
 
-    def split_traj_by_distance(self, distance_bins: list = None):
+    def split_traj_by_distance(self, distance_bins=None):
         """
-        按距离阈值分段（用于课程学习）。
+        按距离分段（用于课程学习）。
 
-        distance_bins: 距离分段边界，如 [0, 4, 8, 12, 100] 分 4 段。
-                       默认 None → 不分段，返回全部数据。
+        distance_bins:
+          - int → pd.qcut 均分为 N 段
+          - list → pd.cut 按给定边界分段，如 [0, 4, 8, 12, 100]
+          - None → 不分段，返回全部数据
         """
         if self.traj is None or len(self.traj) == 0:
             return [self.traj]
 
-        if distance_bins is None or len(distance_bins) < 2:
+        if distance_bins is None:
             return [self.traj.copy().reset_index(drop=True)]
 
         required_cols = {'locxo', 'locyo', 'loczo', 'locxd', 'locyd', 'loczd'}
@@ -252,7 +255,10 @@ class PathEnv:
             ), axis=1
         )
 
-        sid = pd.cut(df['_dist'], bins=distance_bins, labels=False, include_lowest=True)
+        if isinstance(distance_bins, int):
+            sid = pd.qcut(df['_dist'], q=distance_bins, labels=False)
+        else:
+            sid = pd.cut(df['_dist'], bins=distance_bins, labels=False, include_lowest=True)
         df['_sid'] = sid.astype(int)
 
         stage_trajs = []
@@ -285,14 +291,11 @@ class PathEnv:
         dist_change = prev_dist - curr_dist
 
         if dist_change > 0:
-            reward += 1
+            reward += 1.0
+            reward += 0.3 if is_on_road else -1.3   # 靠近时 off-road 小罚
         else:
-            reward -= 1
-        
-        if is_on_road:
-            reward += 1
-        else:
-            reward -= 1.5
+            reward -= 1.0
+            reward += 0.5 if is_on_road else -1.5   # 远离时 off-road 重罚
 
         return reward
 
@@ -359,6 +362,9 @@ class PathEnv:
         # 计算奖励
         reward = self.calculate_reward(reward, prev_dist, curr_dist, self.neighbor, action)
 
+        # 追踪每步是否在路上（self.neighbor 还指向旧位置，ACTION_TO_HEX_IDX 对应目标格子）
+        self.on_road_steps += int(self.neighbor[ACTION_TO_HEX_IDX[action]] != 0)
+
         # 更新 neighbor
         self.neighbor = get_hex_neighborhood(
             self.multi_mapdata, *self.hex_start, radius=1
@@ -375,10 +381,11 @@ class PathEnv:
         if curr_dist <= self.distance_threshold:
             done = True
             success = 1
-            reward += 50
+            match_ratio = self.on_road_steps / max(1, self.step_cnt)
+            reward += self.step_cnt * match_ratio
         elif self.step_cnt >= self.max_step:
             done = True
-            reward -= 30
+            reward -= self.step_cnt
         else:
             done = False
 
