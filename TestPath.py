@@ -18,7 +18,7 @@ SAVE_DIR = "TestPath_results"
 FOV = 5
 USE_GNN = False
 MAX_STEPS = 300
-SAVE_FIGURES = True
+SAVE_FIGURES = 5  # True=全部保存, False/0=不保存, N=每种mode保存N个ID的图像
 
 # True: 测试时使用 row['mode'] 作为唯一选中模式
 # False: 保持环境原有随机 mode 采样
@@ -385,7 +385,8 @@ def load_agent(env, model_path: str, use_gnn: bool = True):
     return agent
 
 
-def run_eval(env, agent, traj_df, max_steps: int, save_dir: str):
+def run_eval(env, agent, traj_df, max_steps: int, save_dir: str,
+             save_figures=True):
     os.makedirs(save_dir, exist_ok=True)
 
     episodes = len(traj_df)
@@ -395,12 +396,20 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str):
     match_list = []
     trans_list = []
 
+    # 每种 mode 已保存的 ID 计数
+    mode_saved_count = {m: 0 for m in ['TG', 'GG', 'GSD', 'TS']}
+    mode_saved_ids = {m: set() for m in ['TG', 'GG', 'GSD', 'TS']}
+    save_all = save_figures is True
+    save_limit = int(save_figures) if isinstance(save_figures, (int, float)) and not save_all else None
+
     # ID 聚合图缓存
     current_id = None
+    current_mode = None
     id_buffer = []
+    id_save_eligible = False
 
     def _flush_id_buffer():
-        if id_buffer and current_id is not None:
+        if id_buffer and current_id is not None and id_save_eligible:
             plot_combined_for_id(id_buffer, current_id, save_dir,
                                 mapdata=env.mapdata)
             id_buffer.clear()
@@ -414,7 +423,30 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str):
 
         if current_id is not None and row_id != current_id:
             _flush_id_buffer()
-        current_id = row_id
+            # 新 ID 到来时才决定是否保存当前 mode + ID
+            current_id = row_id
+            current_mode = real_mode
+            if save_all:
+                id_save_eligible = True
+            elif save_limit is not None and save_limit > 0:
+                id_save_eligible = mode_saved_count[real_mode] < save_limit
+                if id_save_eligible and row_id not in mode_saved_ids[real_mode]:
+                    mode_saved_ids[real_mode].add(row_id)
+                    mode_saved_count[real_mode] += 1
+            else:
+                id_save_eligible = False
+        elif current_id is None:
+            current_id = row_id
+            current_mode = real_mode
+            if save_all:
+                id_save_eligible = True
+            elif save_limit is not None and save_limit > 0:
+                id_save_eligible = mode_saved_count[real_mode] < save_limit
+                if id_save_eligible and row_id not in mode_saved_ids[real_mode]:
+                    mode_saved_ids[real_mode].add(row_id)
+                    mode_saved_count[real_mode] += 1
+            else:
+                id_save_eligible = False
 
         if USE_ROW_MODE_FROM_DATA:
             env.selected_mode = np.array([real_mode])
@@ -470,11 +502,11 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str):
 
         id_buffer.append(records[-1])
 
-        # ====== 画单条轨迹 ======
-        if SAVE_FIGURES:
+        # ====== 画单条轨迹（仅保存被选中的 ID） ======
+        if id_save_eligible:
             ep_dir = os.path.join(save_dir, "episodes")
             os.makedirs(ep_dir, exist_ok=True)
-            fname = (f"{row_id}_{ep:04d}_succ{success_flag}"
+            fname = (f"{real_mode}_{row_id}_{ep:04d}_succ{success_flag}"
                      f"_match{match_rate:.2f}.png")
             plot_trajectory(traj, hex_end, real_mode,
                             selected_mode_str,
@@ -522,6 +554,21 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str):
                   f"succ={sub['success'].mean()*100:.1f}%, "
                   f"match={sub['match'].mean()*100:.1f}%")
 
+    # ====== 按 ID 聚合保存 ======
+    id_stats = df.groupby('ID').agg(
+        mode=('real_mode', 'first'),
+        segments=('success', 'count'),
+        succ_rate=('success', 'mean'),
+        avg_match=('match', 'mean'),
+        avg_trans=('min_trans', 'mean'),
+    ).reset_index()
+    id_csv = os.path.join(save_dir, "id_stats.csv")
+    id_stats.to_csv(id_csv, index=False, encoding='utf-8')
+    print(f"\nSaved per-ID stats to: {id_csv}")
+    print(f"  Total IDs: {len(id_stats)}, "
+          f"fully successful: {(id_stats['succ_rate'] == 1.0).sum()}, "
+          f"avg_match>=80%: {(id_stats['avg_match'] >= 0.8).sum()}")
+
     return df
 
 
@@ -545,4 +592,5 @@ if __name__ == "__main__":
 
     agent = load_agent(env, MODEL_PATH, use_gnn=USE_GNN)
     print(f"Running evaluation, saving to {SAVE_DIR}/")
-    run_eval(env, agent, traj_df, max_steps=MAX_STEPS, save_dir=SAVE_DIR)
+    run_eval(env, agent, traj_df, max_steps=MAX_STEPS, save_dir=SAVE_DIR,
+             save_figures=SAVE_FIGURES)
