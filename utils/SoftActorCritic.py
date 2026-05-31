@@ -304,10 +304,12 @@ class DiscreteSACAgent:
 
         self.q1_optim.zero_grad()
         q1_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q1.parameters(), 10.0)
         self.q1_optim.step()
 
         self.q2_optim.zero_grad()
         q2_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q2.parameters(), 10.0)
         self.q2_optim.step()
 
         # ===== Actor =====
@@ -323,6 +325,7 @@ class DiscreteSACAgent:
 
         self.actor_optim.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 5.0)
         self.actor_optim.step()
 
         # ===== Alpha =====

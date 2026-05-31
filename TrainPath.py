@@ -339,7 +339,7 @@ if __name__ == "__main__":
     train_mode = True
     curriculum_mode = False
     USE_GNN = False
-    FOV = 3
+    FOV = 5
     distance_threshold = 1.0
     env = PathEnv(train_mode=train_mode,
                   curriculum_mode=curriculum_mode,

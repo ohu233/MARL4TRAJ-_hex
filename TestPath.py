@@ -13,9 +13,9 @@ from utils.hex_utils import hex_distance
 
 # ========== 配置 ==========
 TRAJ_CSV = 'data/artificial_od_single.csv'
-MODEL_PATH = "PathModel\sac_actor_ep5000.pth"
+MODEL_PATH = "PathModel\sac_actor_ep25000.pth"
 SAVE_DIR = "TestPath_results"
-FOV = 3
+FOV = 5
 USE_GNN = False
 MAX_STEPS = 300
 SAVE_FIGURES = True

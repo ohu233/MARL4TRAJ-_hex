@@ -176,6 +176,7 @@ class PathEnv:
         self.state['candidate_modes'] = self.candidate_modes
         self.min_trans_count = 0
         self.on_road_steps = 0
+        self.prev_action = None
 
         return self.state
 
@@ -364,6 +365,15 @@ class PathEnv:
 
         # 追踪每步是否在路上（self.neighbor 还指向旧位置，ACTION_TO_HEX_IDX 对应目标格子）
         self.on_road_steps += int(self.neighbor[ACTION_TO_HEX_IDX[action]] != 0)
+
+        # 方向连续性：直行奖励，掉头惩罚
+        if self.prev_action is not None:
+            diff = min((action - self.prev_action) % 6, (self.prev_action - action) % 6)
+            if diff == 0:
+                reward += 0.15      # 直行
+            elif diff == 3:
+                reward -= 0.3       # 180° 掉头
+        self.prev_action = action
 
         # 更新 neighbor
         self.neighbor = get_hex_neighborhood(
