@@ -55,8 +55,8 @@ def train_sac_on_pathenv(
 
     stage_trajs = env.split_traj_by_distance(curriculum_cfg.distance_bins)
     stage_idx = 0
-    env.set_curriculum_stage(stage_idx, stage_trajs[stage_idx], max_mode_count=4)
-    env.set_mode_sampling_range(min_mode_count=1, max_mode_count=4)
+    env.set_curriculum_stage(stage_idx, stage_trajs[stage_idx], max_mode_count=3)
+    env.set_mode_sampling_range(min_mode_count=1, max_mode_count=3)
 
 
     in_refine_phase = False
@@ -251,8 +251,8 @@ def train_sac_on_pathenv(
                     [curr_data, prev_data.sample(n=min(n_mix, len(prev_data)), random_state=42)],
                     ignore_index=True,
                 )
-                env.set_curriculum_stage(stage_idx, mixed, max_mode_count=4)
-                env.set_mode_sampling_range(min_mode_count=1, max_mode_count=4)
+                env.set_curriculum_stage(stage_idx, mixed, max_mode_count=3)
+                env.set_mode_sampling_range(min_mode_count=1, max_mode_count=3)
                 stage_episode_count = 0
                 stage_stable_count = 0
                 refine_stable_count = 0

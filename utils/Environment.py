@@ -453,7 +453,9 @@ class PathEnv:
             done = True
             success = 1
             match_ratio = self.on_road_steps / max(1, self.step_cnt)
-            reward += self.step_cnt * match_ratio
+            # 路径长度无关的 terminal bonus：固定 match 奖励 + 固定成功奖励
+            # 避免 agent 学会"绕远点拿更多 step_cnt*match_ratio"
+            reward += 30.0 * match_ratio + 20.0
         elif self.step_cnt >= self.max_step:
             done = True
             reward -= self.step_cnt
