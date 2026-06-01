@@ -10,6 +10,7 @@
 """
 
 import pickle
+from collections import deque
 import numpy as np
 
 # ============================================================
@@ -67,6 +68,58 @@ def hex_sub(c1, c2):
 def hex_neighbors(q, r, s):
     """返回 (q, r, s) 的 6 个邻居"""
     return [(q + dq, r + dr, s + ds) for dq, dr, ds in HEX_DIRECTIONS]
+
+
+# ============================================================
+# BFS 路网距离场
+# ============================================================
+def find_nearest_road_cell(center_q, center_r, center_s, mapdata_dict, max_radius=30):
+    """
+    以 (center_q, center_r, center_s) 为中心，逐环搜索最近的路网 cell。
+
+    参数:
+        center_q, center_r, center_s: 搜索中心 cube 坐标
+        mapdata_dict: {cube → value} dict，value != 0 表示该 cell 有路
+        max_radius: 最大搜索半径（环数）
+
+    返回:
+        最近的 road cell (q, r, s) 或 None（未找到）
+    """
+    for ring_r in range(max_radius + 1):
+        for dq, dr, ds in _hex_ring_offsets(ring_r):
+            key = (center_q + dq, center_r + dr, center_s + ds)
+            if mapdata_dict.get(key, 0) != 0:
+                return key
+    return None
+
+
+def build_bfs_distance_field(start_q, start_r, start_s, mapdata_dict, max_nodes=50000):
+    """
+    从 (start_q, start_r, start_s) 出发，在 mapdata_dict 有效 cell 上运行 BFS，
+    构建距离场。
+
+    参数:
+        start_q, start_r, start_s: BFS 起点 cube 坐标
+        mapdata_dict: {cube → value} dict，value != 0 表示该 cell 可通行
+        max_nodes: BFS 最大节点数限制
+
+    返回:
+        dict: {(q, r, s) → bfs_steps}，从起点到该 cell 的最短步数
+              如果起点本身不在路网上，返回空 dict
+    """
+    start_key = (start_q, start_r, start_s)
+    if mapdata_dict.get(start_key, 0) == 0:
+        return {}
+
+    dist = {start_key: 0}
+    queue = deque([start_key])
+    while queue and len(dist) < max_nodes:
+        cur = queue.popleft()
+        for nb in hex_neighbors(*cur):
+            if nb not in dist and mapdata_dict.get(nb, 0) != 0:
+                dist[nb] = dist[cur] + 1
+                queue.append(nb)
+    return dist
 
 
 # ============================================================

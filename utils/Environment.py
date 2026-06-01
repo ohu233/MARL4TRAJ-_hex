@@ -11,6 +11,7 @@ from utils.hex_utils import (
     hex_distance, hex_is_valid, hex_add, hex_sub,
     get_hex_neighborhood, load_hex_mapdata, load_hex_mapdata_raw,
     code_to_mode_matrices,
+    find_nearest_road_cell, build_bfs_distance_field,
     HEX_RADIUS,
 )
 
@@ -42,6 +43,8 @@ class PathEnv:
                  traj: pd.DataFrame = None,
                  FOV: int = 1,
                  distance_threshold: float = 1.0,
+                 bfs_search_radius: int = 30,
+                 bfs_max_nodes: int = 50000,
                  ):
 
         self.selected_mode = selected_mode
@@ -51,6 +54,10 @@ class PathEnv:
         self.traj_cnt = 0
         self.FOV = FOV
         self.distance_threshold = distance_threshold
+        self.bfs_search_radius = bfs_search_radius
+        self.bfs_max_nodes = bfs_max_nodes
+        self._bfs_dist = None
+        self._road_end = None
 
         # 加载 hex 地图数据
         if mapdata is not None:
@@ -135,13 +142,38 @@ class PathEnv:
             for cube in mode_dict:
                 self.multi_mapdata[cube] = 1
 
+        # 搜索起终点最近的路网接触点
+        road_start = find_nearest_road_cell(
+            *hex_start, self.multi_mapdata, max_radius=self.bfs_search_radius
+        )
+        self._road_end = find_nearest_road_cell(
+            *hex_end, self.multi_mapdata, max_radius=self.bfs_search_radius
+        )
+
+        # 从 road_end 出发 BFS 构建路网距离场
+        if self._road_end is not None:
+            self._bfs_dist = build_bfs_distance_field(
+                *self._road_end, self.multi_mapdata, max_nodes=self.bfs_max_nodes
+            )
+        else:
+            self._bfs_dist = None
+
+        # 计算 max_step：优先用路网约束下的有效距离
+        if road_start is not None and self._bfs_dist is not None and road_start in self._bfs_dist:
+            eff_dist = (
+                hex_distance(hex_start, road_start)
+                + self._bfs_dist[road_start]
+                + hex_distance(self._road_end, hex_end)
+            )
+            self.max_step = max(1, int(eff_dist * 3))
+        else:
+            h_dist = hex_distance(hex_start, hex_end)
+            self.max_step = max(1, int(h_dist * 3))
+
         # neighbor: 半径1六边形邻域
         self.neighbor = get_hex_neighborhood(
             self.multi_mapdata, hex_start[0], hex_start[1], hex_start[2], radius=1
         )
-
-        h_dist = hex_distance(hex_start, hex_end)
-        self.max_step = max(1, int(h_dist * 3))
 
         self.traj_cnt += 1
 
@@ -300,6 +332,17 @@ class PathEnv:
 
         return reward
 
+    def _effective_distance_to_goal(self, pos):
+        """计算 pos 到终点的有效距离（考虑路网约束）。
+
+        pos: 绝对 cube 坐标 (q, r, s)
+        """
+        pos_key = (int(round(pos[0])), int(round(pos[1])), int(round(pos[2])))
+        if self._bfs_dist is not None and pos_key in self._bfs_dist:
+            return float(self._bfs_dist[pos_key] + hex_distance(self._road_end, self.hex_end))
+        else:
+            return float(hex_distance(pos, self.hex_end))
+
     def step(self, action: int):
         '''
         采取动作，计算奖励，更新状态
@@ -309,11 +352,8 @@ class PathEnv:
         done = False
         self.step_cnt += 1
 
-        # 计算移动前的距离（hex distance）
-        prev_dist = hex_distance(
-            (0, 0, 0),
-            tuple(self.state['remaining_distance'])
-        )
+        # 计算移动前的距离（路网约束下的有效距离）
+        prev_dist = self._effective_distance_to_goal(self.hex_start)
 
         # 更新位置偏移（cube coords）
         dq, dr, ds = HEX_DIRECTIONS[action]
@@ -357,8 +397,8 @@ class PathEnv:
         rem = hex_sub(self.hex_end, self.hex_start)
         self.state['remaining_distance'] = (rem[0], rem[1], rem[2])
 
-        # 计算移动后的距离
-        curr_dist = hex_distance((0, 0, 0), rem)
+        # 计算移动后的距离（路网约束下的有效距离）
+        curr_dist = self._effective_distance_to_goal(self.hex_start)
 
         # 计算奖励
         reward = self.calculate_reward(reward, prev_dist, curr_dist, self.neighbor, action)

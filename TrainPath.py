@@ -346,7 +346,9 @@ if __name__ == "__main__":
                   mapdata=mapdata,
                   traj=shuffled_traj,
                   FOV=FOV,
-                  distance_threshold=distance_threshold
+                  distance_threshold=distance_threshold,
+                  bfs_search_radius=30,
+                  bfs_max_nodes=50000,
                   )
 
     curriculum_cfg = CurriculumConfig(

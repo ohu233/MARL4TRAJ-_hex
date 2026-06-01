@@ -18,7 +18,7 @@ SAVE_DIR = "TestPath_results"
 FOV = 5
 USE_GNN = False
 MAX_STEPS = 300
-SAVE_FIGURES = 5  # True=全部保存, False/0=不保存, N=每种mode保存N个ID的图像
+SAVE_FIGURES = 15  # True=全部保存, False/0=不保存, N=每种mode保存N个ID的图像
 
 # True: 测试时使用 row['mode'] 作为唯一选中模式
 # False: 保持环境原有随机 mode 采样
