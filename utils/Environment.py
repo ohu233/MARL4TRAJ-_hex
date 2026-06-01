@@ -58,6 +58,7 @@ class PathEnv:
         self.bfs_max_nodes = bfs_max_nodes
         self._bfs_dist = None
         self._road_end = None
+        self._bfs_total = 0
 
         # 加载 hex 地图数据
         if mapdata is not None:
@@ -166,9 +167,11 @@ class PathEnv:
                 + hex_distance(self._road_end, hex_end)
             )
             self.max_step = max(1, int(eff_dist * 3))
+            self._bfs_total = int(self._bfs_dist[road_start] + hex_distance(self._road_end, hex_end))
         else:
             h_dist = hex_distance(hex_start, hex_end)
             self.max_step = max(1, int(h_dist * 3))
+            self._bfs_total = int(h_dist)
 
         # neighbor: 半径1六边形邻域
         self.neighbor = get_hex_neighborhood(
@@ -188,6 +191,8 @@ class PathEnv:
             'remaining_distance': np.array(rem),       # cube 偏移
             'previous_remaining_distance': np.array(rem),
             'total_distance': np.array(rem),           # 总偏移（定值）
+            'bfs_remaining': self._effective_distance_to_goal(hex_start),
+            'bfs_total': float(self._bfs_total),
             'current_mode': self.selected_mode,
             'patch': (
                 get_hex_neighborhood(self.multi_mapdata, *hex_start, radius=self.FOV).tolist() +
@@ -343,6 +348,19 @@ class PathEnv:
         else:
             return float(hex_distance(pos, self.hex_end))
 
+    def get_episode_metadata(self):
+        """Return episode-level metadata needed by HER/EpisodeBuffer.
+
+        Returns a dict with absolute coordinates of origin/destination and the
+        BFS distance field built for this episode (or None if unavailable).
+        """
+        return {
+            'hex_start': tuple(self.hex_start),
+            'hex_end': tuple(self.hex_end),
+            'bfs_dist': self._bfs_dist,
+            'road_end': self._road_end,
+        }
+
     def step(self, action: int):
         '''
         采取动作，计算奖励，更新状态
@@ -396,6 +414,9 @@ class PathEnv:
         # 更新剩余距离向量
         rem = hex_sub(self.hex_end, self.hex_start)
         self.state['remaining_distance'] = (rem[0], rem[1], rem[2])
+
+        # 更新 BFS 距离
+        self.state['bfs_remaining'] = self._effective_distance_to_goal(self.hex_start)
 
         # 计算移动后的距离（路网约束下的有效距离）
         curr_dist = self._effective_distance_to_goal(self.hex_start)
@@ -496,7 +517,7 @@ class ModeEnv:
         cfg = SACConfig()
         device = torch.device(cfg.device)
 
-        path_agent = DiscreteSACAgent(vec_dim=20, hex_radius=self.fov, action_dim=6,
+        path_agent = DiscreteSACAgent(vec_dim=23, hex_radius=self.fov, action_dim=6,
                                        cfg=cfg, use_gnn=True, in_channels=5)
         state_dict = torch.load(self.model_path, map_location=device)
         path_agent.actor.load_state_dict(state_dict)

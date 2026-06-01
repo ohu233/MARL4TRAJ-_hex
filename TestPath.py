@@ -13,7 +13,7 @@ from utils.hex_utils import hex_distance
 
 # ========== 配置 ==========
 TRAJ_CSV = 'data/artificial_od_single.csv'
-MODEL_PATH = "PathModel\sac_actor_ep25000.pth"
+MODEL_PATH = "PathModel\sac_actor_ep5000.pth"
 SAVE_DIR = "TestPath_results"
 FOV = 5
 USE_GNN = False
@@ -376,7 +376,7 @@ def load_env(traj_df, use_row_mode_from_data: bool = False, fov: int = 3):
 def load_agent(env, model_path: str, use_gnn: bool = True):
     cfg = SACConfig(device="cpu")
     device = torch.device(cfg.device)
-    agent = DiscreteSACAgent(vec_dim=20, hex_radius=env.FOV, action_dim=6,
+    agent = DiscreteSACAgent(vec_dim=23, hex_radius=env.FOV, action_dim=6,
                               cfg=cfg, use_gnn=use_gnn, in_channels=5)
     state_dict = torch.load(model_path, map_location=device)
     agent.actor.load_state_dict(state_dict)

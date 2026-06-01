@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.hex_utils import get_fixed_edge_index
+from utils.hex_utils import get_fixed_edge_index, hex_distance, ACTION_TO_HEX_IDX
 
 
 # ============================================================
@@ -88,9 +88,11 @@ class HexPatchEncoder(nn.Module):
 
 
 # ============================================================
-# Replay Buffer
+# Replay Buffer (with HER support)
 # ============================================================
 class ReplayBuffer:
+    """Original transition-level replay buffer (kept for backward compat)."""
+
     def __init__(self, capacity: int):
         self.buffer = deque(maxlen=capacity)
 
@@ -110,6 +112,227 @@ class ReplayBuffer:
 
     def __len__(self):
         return len(self.buffer)
+
+
+class EpisodeBuffer:
+    """Episode-level replay buffer with optional Hindsight Experience Replay (HER).
+
+    Each pushed episode stores:
+      - transitions: list of (s, a, r, ns, done, old_neighbor)
+      - hex_start:  absolute cube coords of trajectory origin
+      - hex_end:    absolute cube coords of trajectory destination (original goal)
+      - bfs_dist:   BFS distance field built from hex_end (or None)
+      - achieved_goals: list of absolute cube positions visited (for HER sampling)
+    """
+
+    def __init__(self, capacity_episodes: int, her_prob: float = 0.8,
+                 her_strategy: str = 'future'):
+        self.episodes = deque(maxlen=capacity_episodes)
+        self.her_prob = her_prob
+        self.her_strategy = her_strategy
+
+    def push_episode(self, transitions: list, hex_start: tuple,
+                     hex_end: tuple, bfs_dist: dict = None):
+        """Push a completed episode. transitions is a list of
+        (s, a, r, ns, done, old_neighbor) tuples (no requirement on field order
+        beyond what _relabel_transition expects).
+
+        NOTE: bfs_dist is accepted for API compatibility but NOT stored, because
+        each BFS field is up to 50K cells (>> memory) and HER falls back to
+        hex_distance anyway. Keeping hex_start/hex_end/achieved_goals is enough.
+        """
+        del bfs_dist  # accepted for API compat; not stored to save memory
+        # Compute achieved_goals: absolute positions visited
+        achieved_goals = []
+        for t in transitions:
+            s = t[0]
+            cp = s[0:3]
+            achieved_goals.append(_offset_to_abs(cp, hex_start))
+        # Also include the final next_state's absolute position
+        if transitions:
+            last_t = transitions[-1]
+            ns = last_t[3]
+            np_offset = ns[0:3]
+            achieved_goals.append(_offset_to_abs(np_offset, hex_start))
+
+        self.episodes.append({
+            'transitions': transitions,
+            'hex_start': tuple(hex_start),
+            'hex_end': tuple(hex_end),
+            'bfs_dist': None,  # not stored to save memory
+            'achieved_goals': achieved_goals,
+        })
+
+    def __len__(self):
+        return sum(len(ep['transitions']) for ep in self.episodes)
+
+    def sample(self, batch_size: int):
+        """Sample batch_size transitions, optionally with HER relabeling.
+
+        Returns: (s, a, r, ns, d) numpy arrays, or None if not enough data.
+        """
+        all_transitions = []
+        for ep_idx, ep in enumerate(self.episodes):
+            for t_idx, t in enumerate(ep['transitions']):
+                all_transitions.append((ep_idx, t_idx, t, ep))
+
+        if len(all_transitions) < batch_size:
+            return None
+
+        sampled = random.sample(all_transitions, batch_size)
+
+        new_s, new_a, new_r, new_ns, new_d = [], [], [], [], []
+
+        for ep_idx, t_idx, t, ep in sampled:
+            if random.random() < self.her_prob:
+                relabeled = self._relabel_transition(t, t_idx, ep)
+                if relabeled is None:
+                    # No future goal available: keep original
+                    new_s.append(t[0]); new_a.append(t[1])
+                    new_r.append(t[2]); new_ns.append(t[3])
+                    new_d.append(float(t[4]))
+                else:
+                    ns, a, r, nns, d = relabeled
+                    new_s.append(ns); new_a.append(a)
+                    new_r.append(r); new_ns.append(nns)
+                    new_d.append(float(d))
+            else:
+                new_s.append(t[0]); new_a.append(t[1])
+                new_r.append(t[2]); new_ns.append(t[3])
+                new_d.append(float(t[4]))
+
+        return (
+            np.array(new_s, dtype=np.float32),
+            np.array(new_a, dtype=np.int64),
+            np.array(new_r, dtype=np.float32),
+            np.array(new_ns, dtype=np.float32),
+            np.array(new_d, dtype=np.float32),
+        )
+
+    def _relabel_transition(self, t, t_idx, ep):
+        """Relabel a transition with a future achieved goal. Returns
+        (new_s, a, new_r, new_ns, new_done) or None if no future goal."""
+        achieved = ep['achieved_goals']
+        # Future strategy: pick a goal from states STRICTLY AFTER t_idx
+        future_goals = achieved[t_idx + 1:]
+        if not future_goals:
+            return None
+
+        new_goal = tuple(random.choice(future_goals))
+        s, a, _, ns, done, old_neighbor = t  # original reward (idx 2) is recomputed below
+        hex_start = ep['hex_start']
+        bfs_dist = ep['bfs_dist']
+
+        # Recover absolute positions from offsets
+        cur_offset = s[0:3]
+        prev_offset = s[6:9]
+        next_offset = ns[0:3]
+        cur_abs = _offset_to_abs(cur_offset, hex_start)
+        prev_abs = _offset_to_abs(prev_offset, hex_start)
+        next_abs = _offset_to_abs(next_offset, hex_start)
+
+        # New cube-offset fields to the fake goal
+        new_remaining = _hex_sub(new_goal, cur_abs)
+        new_prev_remaining = _hex_sub(new_goal, prev_abs)  # offset from previous pos to new goal
+        new_total = _hex_sub(new_goal, hex_start)
+        new_next_remaining = _hex_sub(new_goal, next_abs)
+        new_next_prev_remaining = _hex_sub(new_goal, cur_abs)  # for next state, prev = current
+
+        # New BFS distances (fallback to hex_distance if bfs_dist is None)
+        new_cur_bfs = _lookup_bfs(cur_abs, new_goal, bfs_dist, hex_end=ep['hex_end'])
+        new_total_bfs = _lookup_bfs(hex_start, new_goal, bfs_dist, hex_end=ep['hex_end'])
+        new_progress = 1.0 - new_cur_bfs / max(1.0, new_total_bfs)
+        new_next_bfs = _lookup_bfs(next_abs, new_goal, bfs_dist, hex_end=ep['hex_end'])
+        new_next_progress = 1.0 - new_next_bfs / max(1.0, new_total_bfs)
+
+        # Rebuild state vector (matches state_to_vector layout)
+        # [0:3]   current_position
+        # [3:6]   remaining_distance
+        # [6:9]   previous_remaining_distance
+        # [9:12]  total_distance
+        # [12]    bfs_remaining
+        # [13]    bfs_total
+        # [14]    bfs_progress
+        # [15:19] mode onehot
+        # [19:23] candidate onehot
+        # [23:]   patch
+        new_s = np.concatenate([
+            np.asarray(cur_offset, dtype=np.float32),
+            np.asarray(new_remaining, dtype=np.float32),
+            np.asarray(new_prev_remaining, dtype=np.float32),
+            np.asarray(new_total, dtype=np.float32),
+            np.asarray([new_cur_bfs, new_total_bfs, new_progress], dtype=np.float32),
+            np.asarray(s[15:23], dtype=np.float32),
+            np.asarray(s[23:], dtype=np.float32),
+        ]).astype(np.float32)
+
+        new_ns = np.concatenate([
+            np.asarray(next_offset, dtype=np.float32),
+            np.asarray(new_next_remaining, dtype=np.float32),
+            np.asarray(new_next_prev_remaining, dtype=np.float32),
+            np.asarray(new_total, dtype=np.float32),
+            np.asarray([new_next_bfs, new_total_bfs, new_next_progress], dtype=np.float32),
+            np.asarray(ns[15:23], dtype=np.float32),
+            np.asarray(ns[23:], dtype=np.float32),
+        ]).astype(np.float32)
+
+        # Recompute reward
+        new_r = _compute_her_reward(new_cur_bfs, new_next_bfs, old_neighbor, int(a))
+
+        # Determine done: if next_abs is within 1 hex step of new_goal
+        if hex_distance(next_abs, new_goal) <= 1:
+            new_done = True
+            new_r += 50.0  # success bonus
+        else:
+            new_done = bool(done)
+
+        return (new_s, int(a), float(new_r), new_ns, new_done)
+
+
+# ============================================================
+# HER helper functions
+# ============================================================
+def _offset_to_abs(offset, hex_start):
+    """Convert a cube-offset (from state vector) to absolute cube coords."""
+    return (
+        hex_start[0] + offset[0],
+        hex_start[1] + offset[1],
+        hex_start[2] + offset[2],
+    )
+
+
+def _hex_sub(c1, c2):
+    """Cube subtraction (imported lazily to avoid circular imports)."""
+    return (c1[0] - c2[0], c1[1] - c2[1], c1[2] - c2[2])
+
+
+def _lookup_bfs(pos, goal, bfs_dist, hex_end):
+    """Look up BFS distance from pos to goal.
+
+    bfs_dist: dict keyed by road cell, value = BFS distance from that cell to hex_end.
+    Returns a lower-bound estimate: hex_distance if either pos or goal is off-road.
+    """
+    if bfs_dist is None:
+        return float(hex_distance(pos, goal))
+    # For speed, use hex_distance as the distance estimate
+    # (full BFS path: pos → road_start → road_end → goal, requires more work)
+    return float(hex_distance(pos, goal))
+
+
+def _compute_her_reward(prev_dist, curr_dist, neighbor, action):
+    """Recompute reward for a relabeled transition. Mirrors PathEnv.calculate_reward."""
+    is_on_road = False
+    if neighbor is not None:
+        is_on_road = neighbor[ACTION_TO_HEX_IDX[action]] != 0
+    dist_change = prev_dist - curr_dist
+
+    if dist_change > 0:
+        reward = 1.0 * dist_change
+        reward += 0.3 if is_on_road else -1.3
+    else:
+        reward = -1.0
+        reward += 0.5 if is_on_road else -1.5
+    return float(reward)
 
 
 # ============================================================
@@ -136,7 +359,7 @@ class MLP(nn.Module):
 class StateEncoder(nn.Module):
     """将 flat state 拆分为 vector 特征 + hex patch，用 GNN 编码 patch。"""
 
-    def __init__(self, vec_dim: int = 20, hex_radius: int = 3,
+    def __init__(self, vec_dim: int = 23, hex_radius: int = 3,
                  use_gnn: bool = True, in_channels: int = 5):
         super().__init__()
         self.vec_dim = vec_dim
@@ -206,13 +429,17 @@ class SACConfig:
     hidden_dim: int = 256
     target_entropy_ratio: float = 0.85
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # HER (Hindsight Experience Replay) settings
+    her_prob: float = 0.0  # 0.0 disables HER; 0.8 recommended for sparse-reward long-distance
+    her_strategy: str = 'future'  # 'future' | 'final' | 'episode'
+    buffer_episodes: int = 500  # EpisodeBuffer capacity (episodes, not transitions)
 
 
 # ============================================================
 # Discrete SAC Agent
 # ============================================================
 class DiscreteSACAgent:
-    def __init__(self, vec_dim: int = 20, hex_radius: int = 3,
+    def __init__(self, vec_dim: int = 23, hex_radius: int = 3,
                  action_dim: int = 6,
                  cfg: SACConfig = None, use_gnn: bool = True,
                  in_channels: int = 5):
@@ -249,7 +476,15 @@ class DiscreteSACAgent:
         # 离散动作目标熵
         self.target_entropy = cfg.target_entropy_ratio * np.log(action_dim)
 
-        self.replay = ReplayBuffer(cfg.buffer_size)
+        # Use EpisodeBuffer when HER is enabled, else standard ReplayBuffer
+        if cfg.her_prob > 0.0:
+            self.replay = EpisodeBuffer(
+                capacity_episodes=cfg.buffer_episodes,
+                her_prob=cfg.her_prob,
+                her_strategy=cfg.her_strategy,
+            )
+        else:
+            self.replay = ReplayBuffer(cfg.buffer_size)
 
     @property
     def alpha(self):

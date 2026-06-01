@@ -14,7 +14,7 @@ from typing import Dict, List, Tuple
 
 from utils.Environment import PathEnv
 from utils.tools import mapdata_to_modelmatrix, state_to_vector, calculate_match_rate
-from utils.SoftActorCritic import ReplayBuffer, MLP, SACConfig, DiscreteSACAgent
+from utils.SoftActorCritic import ReplayBuffer, EpisodeBuffer, MLP, SACConfig, DiscreteSACAgent
 
 
 @dataclass
@@ -50,7 +50,7 @@ def train_sac_on_pathenv(
     env.traj_cnt = 0
 
     action_dim = 6
-    agent = DiscreteSACAgent(vec_dim=20, hex_radius=env.FOV, action_dim=action_dim,
+    agent = DiscreteSACAgent(vec_dim=23, hex_radius=env.FOV, action_dim=action_dim,
                               cfg=cfg, use_gnn=use_gnn, in_channels=5)
 
     stage_trajs = env.split_traj_by_distance(curriculum_cfg.distance_bins)
@@ -133,6 +133,11 @@ def train_sac_on_pathenv(
         ep_reward = 0.0
         traj_list.append(env.hex_start)
 
+        # Episode-level HER support: collect transitions and push at episode end
+        use_episode_buffer = isinstance(agent.replay, EpisodeBuffer)
+        ep_transitions = [] if use_episode_buffer else None
+        episode_meta = env.get_episode_metadata() if use_episode_buffer else None
+
         # 本回合 loss 累计
         ep_actor_losses = []
         ep_critic_losses = []
@@ -145,12 +150,18 @@ def train_sac_on_pathenv(
             else:
                 a = agent.select_action(s_vec, evaluate=False)
 
+            # Capture the pre-action neighbor for HER reward recomputation
+            pre_action_neighbor = env.neighbor.copy() if hasattr(env, 'neighbor') else None
+
             ns, r, done, success = env.step(int(a))
             ns_vec = state_to_vector(ns)
 
             traj_list.append(env.hex_start)
 
-            agent.replay.push(s_vec, a, r, ns_vec, float(done))
+            if use_episode_buffer:
+                ep_transitions.append((s_vec, int(a), float(r), ns_vec, bool(done), pre_action_neighbor))
+            else:
+                agent.replay.push(s_vec, a, r, ns_vec, float(done))
             s_vec = ns_vec
             ep_reward += float(r)
 
@@ -163,6 +174,15 @@ def train_sac_on_pathenv(
 
             if done:
                 break
+
+        # Episode-level push for HER
+        if use_episode_buffer and ep_transitions:
+            agent.replay.push_episode(
+                ep_transitions,
+                hex_start=episode_meta['hex_start'],
+                hex_end=episode_meta['hex_end'],
+                bfs_dist=episode_meta['bfs_dist'],
+            )
 
         # 统计traj_list匹配度
         match_rate = calculate_match_rate(traj_list, env.multi_mapdata)
@@ -365,4 +385,8 @@ if __name__ == "__main__":
         prev_stage_mix_ratio=0.4,
     )
 
-    agent, logs = train_sac_on_pathenv(env, episodes=25000, curriculum_cfg=curriculum_cfg, use_gnn=USE_GNN)
+    # HER 配置：默认 0.8 (Future 策略)，可改为 0.0 关闭
+    sac_cfg = SACConfig(her_prob=0.3, her_strategy='future')
+
+    agent, logs = train_sac_on_pathenv(env, episodes=5000, cfg=sac_cfg,
+                                       curriculum_cfg=curriculum_cfg, use_gnn=USE_GNN)
