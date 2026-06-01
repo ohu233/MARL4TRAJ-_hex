@@ -324,16 +324,18 @@ class PathEnv:
         基于距离变化的比例奖励（hex 版本）。
         接近目标的跨度越大奖励越高，远离则惩罚。
         neighbor: 半径1六边形邻域 [center, dir0(北), dir1(西北), dir2(西南), dir3(南), dir4(东南), dir5(东北)]
+
+        on-road 优势 = 3.3 (靠近) / 4.0 (远离) — 强制 agent 偏好 on-road
         '''
         is_on_road = neighbor[ACTION_TO_HEX_IDX[action]] != 0
         dist_change = prev_dist - curr_dist
 
         if dist_change > 0:
             reward += 1.0
-            reward += 0.3 if is_on_road else -1.3   # 靠近时 off-road 小罚
+            reward += 0.8 if is_on_road else -2.5   # 靠近：on-road 优势 0.8 - (-2.5) = 3.3
         else:
             reward -= 1.0
-            reward += 0.5 if is_on_road else -1.5   # 远离时 off-road 重罚
+            reward += 1.0 if is_on_road else -3.0   # 远离：on-road 优势 1.0 - (-3.0) = 4.0
 
         return reward
 
