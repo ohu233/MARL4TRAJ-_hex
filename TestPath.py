@@ -247,8 +247,12 @@ def plot_trajectory(traj_hex, hex_end, mode_str, selected_mode, save_path,
                            marker='s', alpha=0.35, zorder=2,
                            label=f'road_{mode_name}')
 
-    ax.plot(mxs, mys, marker='o', markersize=3, color=color,
-            linewidth=2, alpha=0.9, zorder=4)
+    is_bad_segment = success_flag == 0 or match_rate < 0.8
+    plot_color = 'dimgray' if is_bad_segment else color
+    plot_alpha = 0.55 if is_bad_segment else 0.9
+    plot_linestyle = '--' if is_bad_segment else '-'
+    ax.plot(mxs, mys, marker='o', markersize=3, color=plot_color,
+            linewidth=2, alpha=plot_alpha, linestyle=plot_linestyle, zorder=4)
     ax.scatter(mxs[0], mys[0], c=color, marker='o', s=50,
                edgecolors='red', linewidths=1.5, zorder=6, label='start')
     if end_merc is not None:
@@ -317,7 +321,7 @@ def plot_combined_for_id(items, tid, save_dir, mapdata=None):
 
         color = MODE_COLORS.get(item["mode"], "C0")
         ax.plot(mxs, mys, marker='o', markersize=2, color=color,
-                linewidth=1.5, alpha=0.8, zorder=4)
+                linewidth=1.5, alpha=0.8, linestyle='-', zorder=4)
 
         # 成功后画终止点到终点的连线
         if item["success"] == 1:
@@ -379,6 +383,12 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str,
     reward_list = []
     match_list = []
     trans_list = []
+    offroad_ratio_list = []
+    offroad_streak_max_list = []
+    offroad_total_list = []
+    no_progress_steps_list = []
+    best_bfs_remaining_list = []
+    done_reason_list = []
 
     # 每种 mode 已保存的 ID 计数
     mode_saved_count = {m: 0 for m in ['TG', 'GG', 'GSD', 'TS']}
@@ -465,6 +475,18 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str,
         reward_list.append(total_reward)
         match_list.append(match_rate)
         trans_list.append(env.min_trans_count)
+        offroad_total = int(getattr(env, 'offroad_total', 0))
+        offroad_ratio = float(offroad_total / max(1, getattr(env, 'step_cnt', 1)))
+        offroad_streak_max = int(getattr(env, 'offroad_streak_max', 0))
+        no_progress_steps = int(getattr(env, 'no_progress_steps', 0))
+        best_bfs_remaining = float(getattr(env, 'best_bfs_remaining', 0.0))
+        done_reason = getattr(env, 'done_reason', 'unknown')
+        offroad_total_list.append(offroad_total)
+        offroad_ratio_list.append(offroad_ratio)
+        offroad_streak_max_list.append(offroad_streak_max)
+        no_progress_steps_list.append(no_progress_steps)
+        best_bfs_remaining_list.append(best_bfs_remaining)
+        done_reason_list.append(done_reason)
 
         selected_mode_str = "+".join(env.selected_mode)
         records.append({
@@ -478,6 +500,12 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str,
             "min_trans": int(env.min_trans_count),
             "steps": step_count,
             "final_dist": float(final_dist),
+            "offroad_streak_max": offroad_streak_max,
+            "offroad_total": offroad_total,
+            "offroad_ratio": offroad_ratio,
+            "no_progress_steps": no_progress_steps,
+            "best_bfs_remaining": best_bfs_remaining,
+            "done_reason": done_reason,
             "start_hex": hex_start,
             "end_hex": env.hex_start,
             "goal_hex": hex_end,
@@ -526,7 +554,12 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str,
     print(f"Avg match   : {np.mean(match_list) * 100:.2f}%")
     print(f"Avg trans   : {np.mean(trans_list):.1f}")
     print(f"Avg steps   : {np.mean([r['steps'] for r in records]):.1f}")
+    print(f"Avg offroad : {np.mean(offroad_ratio_list) * 100:.2f}%")
+    print(f"Max streak  : {np.max(offroad_streak_max_list) if offroad_streak_max_list else 0}")
     print("=" * 60)
+    print("\n=== Done reason stats ===")
+    for reason, cnt in df['done_reason'].value_counts().items():
+        print(f"  {reason}: {cnt}")
 
     # ====== 按真实 mode 分组统计 ======
     df['success'] = success_list
@@ -537,7 +570,8 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str,
         if len(sub) > 0:
             print(f"  {m}: count={len(sub)}, "
                   f"succ={sub['success'].mean()*100:.1f}%, "
-                  f"match={sub['match'].mean()*100:.1f}%")
+                  f"match={sub['match'].mean()*100:.1f}%, "
+                  f"offroad={sub['offroad_ratio'].mean()*100:.1f}%")
 
     # ====== 按 ID 聚合保存 ======
     id_stats = df.groupby('ID').agg(
@@ -546,6 +580,7 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str,
         succ_rate=('success', 'mean'),
         avg_match=('match', 'mean'),
         avg_trans=('min_trans', 'mean'),
+        avg_offroad=('offroad_ratio', 'mean'),
     ).reset_index()
     id_csv = os.path.join(save_dir, "id_stats.csv")
     id_stats.to_csv(id_csv, index=False, encoding='utf-8')

@@ -53,22 +53,18 @@ def train_sac_on_pathenv(
     agent = DiscreteSACAgent(vec_dim=23, hex_radius=env.FOV, action_dim=action_dim,
                               cfg=cfg, use_gnn=use_gnn, in_channels=5)
 
-    stage_trajs = env.split_traj_by_distance(curriculum_cfg.distance_bins)
-    stage_idx = 0
-    env.set_curriculum_stage(stage_idx, stage_trajs[stage_idx], max_mode_count=3)
     env.set_mode_sampling_range(min_mode_count=1, max_mode_count=3)
-
-
-    in_refine_phase = False
-    stage_episode_count = 0
-    stage_stable_count = 0
-    refine_stable_count = 0
 
     total_steps = 0
     logs = []
     success_list = []
     match_list = [] # 存储匹配度
     trans_count_list = []
+    offroad_ratio_list = []
+    offroad_streak_max_list = []
+    no_progress_steps_list = []
+    best_bfs_remaining_list = []
+    done_reason_list = []
     traj_list = []  # 临时存储轨迹
 
     avg_reward_100_list = []
@@ -76,9 +72,7 @@ def train_sac_on_pathenv(
     match_rate_100_list = []
     actor_loss_ep_list = []
     critic_loss_ep_list = []
-    curriculum_stage_list = []
     mode_max_count_list = []
-    refine_phase_list = []
 
     tag = ("_withGNN" if use_gnn else "") + ("_withCurri" if env.curriculum_mode else "")
 
@@ -113,20 +107,6 @@ def train_sac_on_pathenv(
         plt.close()
 
 
-    print(f"Curriculum enabled: {len(stage_trajs)} stages.")
-    for sid, stage_df in enumerate(stage_trajs):
-        from utils.hex_utils import hex_distance
-        stage_dist = stage_df.apply(
-            lambda r: hex_distance(
-                (r['locxo'], r['locyo'], r['loczo']),
-                (r['locxd'], r['locyd'], r['loczd']),
-            ), axis=1
-        )
-        print(
-            f"  stage={sid + 1}/{len(stage_trajs)}, samples={len(stage_df)}, "
-            f"dist[min/mean/max]={stage_dist.min():.1f}/{stage_dist.mean():.1f}/{stage_dist.max():.1f}"
-        )
-    
     for ep in range(1, episodes + 1):
         s = env.reset()
         s_vec = state_to_vector(s)
@@ -145,7 +125,11 @@ def train_sac_on_pathenv(
         for t in range(max_episode_steps):
             total_steps += 1
 
-            if total_steps < cfg.start_steps:
+            in_random_exploration = total_steps < cfg.start_steps
+            if hasattr(env, 'offroad_done_enabled'):
+                env.offroad_done_enabled = not in_random_exploration
+
+            if in_random_exploration:
                 a = np.random.randint(action_dim)
             else:
                 a = agent.select_action(s_vec, evaluate=False)
@@ -191,6 +175,11 @@ def train_sac_on_pathenv(
         success_list.append(success)
         match_list.append(match_rate)
         trans_count_list.append(env.min_trans_count)
+        offroad_ratio_list.append(float(getattr(env, 'offroad_total', 0) / max(1, getattr(env, 'step_cnt', 1))))
+        offroad_streak_max_list.append(int(getattr(env, 'offroad_streak_max', 0)))
+        no_progress_steps_list.append(int(getattr(env, 'no_progress_steps', 0)))
+        best_bfs_remaining_list.append(float(getattr(env, 'best_bfs_remaining', 0.0)))
+        done_reason_list.append(getattr(env, 'done_reason', 'unknown'))
 
         window = curriculum_cfg.metrics_window
         avg_reward_100 = np.mean(logs[-window:])
@@ -200,9 +189,7 @@ def train_sac_on_pathenv(
         avg_reward_100_list.append(avg_reward_100)
         reach_rate_100_list.append(reach_rate_100)
         match_rate_100_list.append(match_rate_100)
-        curriculum_stage_list.append(stage_idx + 1)
         mode_max_count_list.append(env.max_mode_count)
-        refine_phase_list.append(int(in_refine_phase))
 
         actor_loss_ep = float(np.mean(ep_actor_losses)) if ep_actor_losses else np.nan
         critic_loss_ep = float(np.mean(ep_critic_losses)) if ep_critic_losses else np.nan
@@ -218,58 +205,6 @@ def train_sac_on_pathenv(
                 f"match rate={match_rate_100:.2f}%, "
                 f"trans={env.min_trans_count} "
             )
-
-        stage_episode_count += 1
-
-        if not in_refine_phase:
-            is_stage_stable = (
-                reach_rate_100 >= curriculum_cfg.promote_reach_rate
-                and match_rate_100 >= curriculum_cfg.promote_match_rate
-            )
-            is_refine_stable = (
-                reach_rate_100 >= curriculum_cfg.refine_reach_rate
-                and match_rate_100 >= curriculum_cfg.refine_match_rate
-            )
-
-            stage_stable_count = stage_stable_count + 1 if is_stage_stable else 0
-            refine_stable_count = refine_stable_count + 1 if is_refine_stable else 0
-
-            can_promote = (
-                stage_episode_count >= curriculum_cfg.min_stage_episodes
-                and stage_stable_count >= curriculum_cfg.promote_patience
-            )
-
-            if can_promote and stage_idx < len(stage_trajs) - 1:
-                prev_stage = stage_idx
-                stage_idx += 1
-                curr_data = stage_trajs[stage_idx]
-                prev_data = stage_trajs[prev_stage]
-                n_mix = int(len(curr_data) * curriculum_cfg.prev_stage_mix_ratio)
-                mixed = pd.concat(
-                    [curr_data, prev_data.sample(n=min(n_mix, len(prev_data)), random_state=42)],
-                    ignore_index=True,
-                )
-                env.set_curriculum_stage(stage_idx, mixed, max_mode_count=3)
-                env.set_mode_sampling_range(min_mode_count=1, max_mode_count=3)
-                stage_episode_count = 0
-                stage_stable_count = 0
-                refine_stable_count = 0
-                print(
-                    f"[Curriculum] Promote to distance stage {stage_idx + 1}/{len(stage_trajs)}"
-                    f" (mixed {curriculum_cfg.prev_stage_mix_ratio*100:.0f}% from stage {prev_stage + 1}, random1-4)."
-                )
-            elif (
-                can_promote
-                and stage_idx == len(stage_trajs) - 1
-                and stage_episode_count >= curriculum_cfg.min_refine_episodes
-                and refine_stable_count >= curriculum_cfg.refine_patience
-            ):
-                in_refine_phase = True
-                env.set_mode_sampling_range(min_mode_count=1, max_mode_count=3)
-                stage_episode_count = 0
-                stage_stable_count = 0
-                refine_stable_count = 0
-                print("[Curriculum] Final stage stable, switch map combo to random1-3.")
 
         if ep % 1000 == 0:
             torch.save(agent.actor.state_dict(), f"PathModel/sac_actor_ep{ep}{tag}.pth")
@@ -324,10 +259,13 @@ def train_sac_on_pathenv(
         "match_rate_100": match_rate_100_list,
         "actor_loss": actor_loss_ep_list,
         "critic_loss": critic_loss_ep_list,
-        "curriculum_stage": curriculum_stage_list,
         "mode_max_count": mode_max_count_list,
-        "in_refine_phase": refine_phase_list,
         "min_trans_count": trans_count_list,
+        "offroad_ratio": offroad_ratio_list,
+        "offroad_streak_max": offroad_streak_max_list,
+        "no_progress_steps": no_progress_steps_list,
+        "best_bfs_remaining": best_bfs_remaining_list,
+        "done_reason": done_reason_list,
     })
 
     metrics_df.to_csv(f"PathModel/train_metrics{tag}.csv", index=False, encoding="utf-8")
@@ -354,7 +292,8 @@ if __name__ == "__main__":
     traj = pd.concat([traj, reversed_traj], ignore_index=True)
 
     shuffled_traj = traj.sample(frac=1, random_state=40).reset_index(drop=True)
-
+    shuffled_traj = shuffled_traj[shuffled_traj['distance_cells'] > 4].reset_index(drop=True)
+    
     # 课程学习开关
     train_mode = True
     curriculum_mode = False
@@ -372,17 +311,8 @@ if __name__ == "__main__":
                   )
 
     curriculum_cfg = CurriculumConfig(
-        distance_bins=4 if curriculum_mode else None,
+        distance_bins=None,
         metrics_window=100,
-        min_stage_episodes=300,
-        promote_reach_rate=85.0,
-        promote_match_rate=80.0,
-        promote_patience=10,
-        min_refine_episodes=300,
-        refine_reach_rate=85.0,
-        refine_match_rate=80.0,
-        refine_patience=4,
-        prev_stage_mix_ratio=0.4,
     )
 
     # HER 配置：默认 0.8 (Future 策略)，可改为 0.0 关闭

@@ -50,6 +50,17 @@ class PathEnv:
                  reward_beta: float = 0.7,
                  adsorption_radius: int = 20,
                  adsorption_K: int = 5,
+                 max_offroad_streak: int = 8,
+                 max_offroad_ratio: float = 0.6,
+                 min_steps_before_offroad_ratio_check: int = 20,
+                 offroad_streak_penalty: float = 0.4,
+                 recovery_bonus: float = 1.0,
+                 offroad_done_enabled: bool = True,
+                 no_progress_patience: int = 12,
+                 no_progress_penalty: float = 0.3,
+                 min_steps_before_no_progress_check: int = 8,
+                 short_success_match_threshold: float = 0.75,
+                 short_success_step_threshold: int = 4,
                  ):
 
         self.selected_mode = selected_mode
@@ -71,6 +82,17 @@ class PathEnv:
         self.reward_beta = reward_beta
         self.adsorption_radius = adsorption_radius
         self.adsorption_K = adsorption_K
+        self.max_offroad_streak = int(max_offroad_streak)
+        self.max_offroad_ratio = float(max_offroad_ratio)
+        self.min_steps_before_offroad_ratio_check = int(min_steps_before_offroad_ratio_check)
+        self.offroad_streak_penalty = float(offroad_streak_penalty)
+        self.recovery_bonus = float(recovery_bonus)
+        self.offroad_done_enabled = bool(offroad_done_enabled)
+        self.no_progress_patience = int(no_progress_patience)
+        self.no_progress_penalty = float(no_progress_penalty)
+        self.min_steps_before_no_progress_check = int(min_steps_before_no_progress_check)
+        self.short_success_match_threshold = float(short_success_match_threshold)
+        self.short_success_step_threshold = int(short_success_step_threshold)
 
         # 加载 hex 地图数据
         if mapdata is not None:
@@ -144,6 +166,10 @@ class PathEnv:
         # 读取起点/终点 cube 坐标
         row = self.traj.iloc[current_traj_idx]
         hex_start, hex_end = self._read_hex_coords(row)
+        if 'distance_cells' in row:
+            self.episode_distance_cells = float(row['distance_cells'])
+        else:
+            self.episode_distance_cells = float(hex_distance(hex_start, hex_end))
 
         self.hex_start = hex_start
         self.hex_end = hex_end
@@ -204,6 +230,7 @@ class PathEnv:
         self.neighbor = get_hex_neighborhood(
             self.multi_mapdata, hex_start[0], hex_start[1], hex_start[2], radius=1
         )
+        initial_eff_dist = self._effective_distance_to_goal(hex_start)
 
         self.traj_cnt += 1
 
@@ -218,7 +245,7 @@ class PathEnv:
             'remaining_distance': np.array(rem),       # cube 偏移
             'previous_remaining_distance': np.array(rem),
             'total_distance': np.array(rem),           # 总偏移（定值）
-            'bfs_remaining': self._effective_distance_to_goal(hex_start),
+            'bfs_remaining': initial_eff_dist,
             'bfs_total': float(self._bfs_total),
             'current_mode': self.selected_mode,
             'patch': (
@@ -230,6 +257,12 @@ class PathEnv:
             ),
             'visit_count': 0,
             'candidate_modes': set(),
+            'offroad_streak': 0,
+            'offroad_total': 0,
+            'offroad_ratio': 0.0,
+            'best_bfs_remaining': float(initial_eff_dist),
+            'no_progress_steps': 0,
+            'done_reason': 'running',
         }
 
         start_modes = {
@@ -240,6 +273,12 @@ class PathEnv:
         self.state['candidate_modes'] = self.candidate_modes
         self.min_trans_count = 0
         self.on_road_steps = 0
+        self.offroad_streak = 0
+        self.offroad_streak_max = 0
+        self.offroad_total = 0
+        self.best_bfs_remaining = float(initial_eff_dist)
+        self.no_progress_steps = 0
+        self.done_reason = 'running'
         self.prev_action = None
 
         return self.state
@@ -347,7 +386,8 @@ class PathEnv:
             self.min_mode_count = self.max_mode_count
 
     def calculate_reward(self, reward, prev_dist, curr_dist, neighbor, action,
-                         prev_cube_dist=None, curr_cube_dist=None):
+                         prev_cube_dist=None, curr_cube_dist=None,
+                         was_offroad_before=False):
         """
         势能场奖励：R_dist = α·ΔD_cube + β·ΔD_net
 
@@ -375,6 +415,14 @@ class PathEnv:
             reward += 1.0 if is_on_road else -3.0
 
         reward += r_dist
+        if is_on_road and delta_net > 0:
+            reward += 0.5 * delta_net
+        elif is_on_road and delta_net <= 0:
+            reward -= 0.5
+        if is_on_road and was_offroad_before:
+            reward += self.recovery_bonus
+        if not is_on_road:
+            reward -= self.offroad_streak_penalty * max(1, self.offroad_streak)
 
         return reward
 
@@ -445,6 +493,8 @@ class PathEnv:
         pre_move_pos = self.hex_start
         pre_move_cube_dist = hex_distance(pre_move_pos, self.hex_end)
         pre_move_eff_dist = self._effective_distance_to_goal(pre_move_pos)
+        action_target_on_road = self.neighbor[ACTION_TO_HEX_IDX[action]] != 0
+        was_offroad_before = self.offroad_streak > 0
 
         # 更新位置偏移（cube coords）
         dq, dr, ds = HEX_DIRECTIONS[action]
@@ -492,21 +542,41 @@ class PathEnv:
 
         self.state['bfs_remaining'] = curr_eff_dist
 
+        if action_target_on_road:
+            self.offroad_streak = 0
+            self.on_road_steps += 1
+        else:
+            self.offroad_streak += 1
+            self.offroad_total += 1
+            self.offroad_streak_max = max(self.offroad_streak_max, self.offroad_streak)
+
+        offroad_ratio = self.offroad_total / max(1, self.step_cnt)
+        self.state['offroad_streak'] = int(self.offroad_streak)
+        self.state['offroad_total'] = int(self.offroad_total)
+        self.state['offroad_ratio'] = float(offroad_ratio)
+
+        if curr_eff_dist < self.best_bfs_remaining:
+            self.best_bfs_remaining = float(curr_eff_dist)
+            self.no_progress_steps = 0
+        else:
+            self.no_progress_steps += 1
+            reward -= self.no_progress_penalty
+        self.state['best_bfs_remaining'] = float(self.best_bfs_remaining)
+        self.state['no_progress_steps'] = int(self.no_progress_steps)
+
         # 计算奖励（势能场公式）
         reward = self.calculate_reward(
             reward, pre_move_eff_dist, curr_eff_dist,
             self.neighbor, action,
             prev_cube_dist=pre_move_cube_dist,
-            curr_cube_dist=curr_cube_dist
+            curr_cube_dist=curr_cube_dist,
+            was_offroad_before=was_offroad_before
         )
 
-        # 追踪每步是否在路上（self.neighbor 还指向旧位置，ACTION_TO_HEX_IDX 对应目标格子）
-        self.on_road_steps += int(self.neighbor[ACTION_TO_HEX_IDX[action]] != 0)
-
-        # 方向连续性：直行奖励，掉头惩罚
+        # TODO：删除：方向连续性：直行奖励，掉头惩罚
         if self.prev_action is not None:
             diff = min((action - self.prev_action) % 6, (self.prev_action - action) % 6)
-            if diff == 0:
+            if diff == 0 and curr_eff_dist <= pre_move_eff_dist:
                 reward += 0.15      # 直行
             elif diff == 3:
                 reward -= 0.3       # 180° 掉头
@@ -526,17 +596,55 @@ class PathEnv:
 
         # 判断 done
         if curr_eff_dist <= self.distance_threshold:
-            done = True
-            success = 1
             match_ratio = self.on_road_steps / max(1, self.step_cnt)
-            # 路径长度无关的 terminal bonus：固定 match 奖励 + 固定成功奖励
-            # 避免 agent 学会"绕远点拿更多 step_cnt*match_ratio"
-            reward += 30.0 * match_ratio + 20.0
+            near_goal_on_road = self.multi_mapdata.get(
+                (int(round(self.hex_start[0])), int(round(self.hex_start[1])), int(round(self.hex_start[2]))),
+                0
+            ) != 0
+            near_goal_adsorbed = self.offroad_streak <= 1 and offroad_ratio <= 0.5
+            if near_goal_on_road or near_goal_adsorbed:
+                done = True
+                success = 1
+                self.done_reason = 'success'
+                # 路径长度无关的 terminal bonus：固定 match 奖励 + 固定成功奖励
+                # 避免 agent 学会"绕远点拿更多 step_cnt*match_ratio"
+                reward += 30.0 * match_ratio + 20.0
+            else:
+                done = True
+                self.done_reason = 'near_goal_offroad'
+                reward -= 20.0 * (1.0 - match_ratio)
+        elif self.offroad_done_enabled and self.offroad_streak >= self.max_offroad_streak:
+            done = True
+            self.done_reason = 'offroad_streak'
+            reward -= 20.0 + self.offroad_streak * self.offroad_streak_penalty
+        elif (
+            self.offroad_done_enabled
+            and self.step_cnt >= self.min_steps_before_no_progress_check
+            and self.no_progress_steps >= self.no_progress_patience
+        ):
+            done = True
+            self.done_reason = 'no_progress'
+            reward -= 20.0 + self.no_progress_steps * self.no_progress_penalty
+        elif (
+            self.offroad_done_enabled
+            and self.step_cnt >= self.min_steps_before_offroad_ratio_check
+            and offroad_ratio > self.max_offroad_ratio
+        ):
+            done = True
+            self.done_reason = 'offroad_ratio'
+            reward -= 20.0 + self.step_cnt * offroad_ratio
         elif self.step_cnt >= self.max_step:
             done = True
+            self.done_reason = 'max_step'
             reward -= self.step_cnt
         else:
             done = False
+            self.done_reason = 'running'
+
+        self.state['offroad_streak'] = int(self.offroad_streak)
+        self.state['offroad_total'] = int(self.offroad_total)
+        self.state['offroad_ratio'] = float(offroad_ratio)
+        self.state['done_reason'] = self.done_reason
 
         return self.state, reward, done, success
 
