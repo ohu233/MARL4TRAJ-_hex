@@ -216,9 +216,7 @@ def train_sac_on_pathenv(
                 f"average reward 100={avg_reward_100:.3f}, "
                 f"reach rate={reach_rate_100:.2f}%, "
                 f"match rate={match_rate_100:.2f}%, "
-                f"trans={env.min_trans_count}, "
-                f"stage={stage_idx + 1}/{len(stage_trajs)}, "
-                f"mode=random1-{env.max_mode_count}"
+                f"trans={env.min_trans_count} "
             )
 
         stage_episode_count += 1
@@ -344,6 +342,8 @@ if __name__ == "__main__":
 
     mapdata = load_hex_mapdata_raw('data/hex_grid.pkl')
     traj = pd.read_csv('data//artificial_od_single.csv')
+    # 筛选掉起终点过近的样本（距离小于等于2个六边格），因为它们过于简单，无法提供有效的训练信号
+    traj = traj[traj['distance_cells'] > 2]
 
     # 对调换起点和终点进行训练，增加数据多样性
     # 六边形 cube 坐标: (locxo, locyo, loczo) ↔ (locxd, locyd, loczd)

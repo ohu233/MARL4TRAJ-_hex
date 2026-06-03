@@ -11,8 +11,9 @@ from utils.hex_utils import (
     hex_distance, hex_is_valid, hex_add, hex_sub,
     get_hex_neighborhood, load_hex_mapdata, load_hex_mapdata_raw,
     code_to_mode_matrices,
-    find_nearest_road_cell, build_bfs_distance_field,
-    HEX_RADIUS,
+    find_nearest_road_cell, find_k_nearest_road_cells,
+    build_bfs_distance_field, build_bfs_distance_field_from_multiple,
+    HEX_RADIUS, _hex_ring_offsets,
 )
 
 
@@ -45,6 +46,10 @@ class PathEnv:
                  distance_threshold: float = 1.0,
                  bfs_search_radius: int = 30,
                  bfs_max_nodes: int = 50000,
+                 reward_alpha: float = 0.3,
+                 reward_beta: float = 0.7,
+                 adsorption_radius: int = 20,
+                 adsorption_K: int = 5,
                  ):
 
         self.selected_mode = selected_mode
@@ -58,7 +63,14 @@ class PathEnv:
         self.bfs_max_nodes = bfs_max_nodes
         self._bfs_dist = None
         self._road_end = None
+        self._C_D = None
         self._bfs_total = 0
+
+        # 势能场奖励参数
+        self.reward_alpha = reward_alpha
+        self.reward_beta = reward_beta
+        self.adsorption_radius = adsorption_radius
+        self.adsorption_K = adsorption_K
 
         # 加载 hex 地图数据
         if mapdata is not None:
@@ -143,7 +155,7 @@ class PathEnv:
             for cube in mode_dict:
                 self.multi_mapdata[cube] = 1
 
-        # 搜索起终点最近的路网接触点
+        # 搜索起终点最近的路网接触点（用于单点兼容）
         road_start = find_nearest_road_cell(
             *hex_start, self.multi_mapdata, max_radius=self.bfs_search_radius
         )
@@ -151,10 +163,25 @@ class PathEnv:
             *hex_end, self.multi_mapdata, max_radius=self.bfs_search_radius
         )
 
-        # 从 road_end 出发 BFS 构建路网距离场
-        if self._road_end is not None:
-            self._bfs_dist = build_bfs_distance_field(
-                *self._road_end, self.multi_mapdata, max_nodes=self.bfs_max_nodes
+        # 构建终点吸附集合 C_D（K 个最近路网点）
+        cd_candidates = find_k_nearest_road_cells(
+            *hex_end, self.multi_mapdata,
+            max_radius=self.adsorption_radius,
+            K=self.adsorption_K
+        )
+        # 如果半径内不足 K 个，扩大搜索
+        if len(cd_candidates) < self.adsorption_K:
+            cd_candidates = find_k_nearest_road_cells(
+                *hex_end, self.multi_mapdata,
+                max_radius=self.bfs_search_radius,
+                K=self.adsorption_K
+            )
+        self._C_D = [c for c in cd_candidates if self.multi_mapdata.get(c, 0) != 0]
+
+        # 从 C_D 多源 BFS 构建路网距离场
+        if self._C_D:
+            self._bfs_dist = build_bfs_distance_field_from_multiple(
+                self._C_D, self.multi_mapdata, max_nodes=self.bfs_max_nodes
             )
         else:
             self._bfs_dist = None
@@ -319,48 +346,90 @@ class PathEnv:
         if self.min_mode_count > self.max_mode_count:
             self.min_mode_count = self.max_mode_count
 
-    def calculate_reward(self, reward, prev_dist, curr_dist, neighbor, action):
-        '''
-        基于距离变化的比例奖励（hex 版本）。
-        接近目标的跨度越大奖励越高，远离则惩罚。
-        neighbor: 半径1六边形邻域 [center, dir0(北), dir1(西北), dir2(西南), dir3(南), dir4(东南), dir5(东北)]
+    def calculate_reward(self, reward, prev_dist, curr_dist, neighbor, action,
+                         prev_cube_dist=None, curr_cube_dist=None):
+        """
+        势能场奖励：R_dist = α·ΔD_cube + β·ΔD_net
 
-        on-road 优势 = 3.3 (靠近) / 4.0 (远离) — 强制 agent 偏好 on-road
-        '''
+        ΔD_cube = D_cube(s_t, D) - D_cube(s_{t+1}, D)  (cube 距离变化)
+        ΔD_net = D_net(s_t, D) - D_net(s_{t+1}, D)    (路网距离变化)
+        α = reward_alpha, β = reward_beta
+        """
+        if prev_cube_dist is None:
+            prev_cube_dist = hex_distance(self.hex_start, self.hex_end)
+        if curr_cube_dist is None:
+            curr_cube_dist = hex_distance(self.hex_start, self.hex_end)
+
+        delta_cube = prev_cube_dist - curr_cube_dist
+        delta_net = prev_dist - curr_dist
+
         is_on_road = neighbor[ACTION_TO_HEX_IDX[action]] != 0
-        dist_change = prev_dist - curr_dist
 
-        if dist_change > 0:
+        r_dist = self.reward_alpha * delta_cube + self.reward_beta * delta_net
+
+        if delta_cube + delta_net > 0:
             reward += 1.0
-            reward += 0.8 if is_on_road else -2.5   # 靠近：on-road 优势 0.8 - (-2.5) = 3.3
+            reward += 0.8 if is_on_road else -2.5
         else:
             reward -= 1.0
-            reward += 1.0 if is_on_road else -3.0   # 远离：on-road 优势 1.0 - (-3.0) = 4.0
+            reward += 1.0 if is_on_road else -3.0
+
+        reward += r_dist
 
         return reward
 
-    def _effective_distance_to_goal(self, pos):
-        """计算 pos 到终点的有效距离（考虑路网约束）。
+    def _adsorption_distance_to_C_D(self, pos):
+        """
+        计算吸附距离 D_net(p, D) = min_{v ∈ C_p} [d_cube(p, v) + d_net(v, C_D)]
 
-        pos: 绝对 cube 坐标 (q, r, s)
+        C_p = {v ∈ G_allowed | d_cube(p, v) ≤ r}
+        d_net(v, C_D) 从多源 BFS 距离场直接查询
         """
         pos_key = (int(round(pos[0])), int(round(pos[1])), int(round(pos[2])))
+
+        # 已在 BFS 距离场中，直接返回
         if self._bfs_dist is not None and pos_key in self._bfs_dist:
-            return float(self._bfs_dist[pos_key] + hex_distance(self._road_end, self.hex_end))
+            return float(self._bfs_dist[pos_key])
+
+        # 否则枚举 C_p（半径 r 内的路网点）
+        best = float('inf')
+        for ring_r in range(self.adsorption_radius + 1):
+            for dq, dr, ds in _hex_ring_offsets(ring_r):
+                cp_key = (pos_key[0] + dq, pos_key[1] + dr, pos_key[2] + ds)
+                if self.multi_mapdata.get(cp_key, 0) == 0:
+                    continue
+                if self._bfs_dist is not None and cp_key in self._bfs_dist:
+                    d_net_v = self._bfs_dist[cp_key]
+                else:
+                    continue
+                candidate = ring_r + d_net_v
+                if candidate < best:
+                    best = candidate
+
+        return float(best) if best != float('inf') else float(hex_distance(pos, self.hex_end))
+
+    def _effective_distance_to_goal(self, pos):
+        """
+        计算 pos 到终点的有效距离（考虑路网约束和终点吸附）。
+
+        D_eff = D_net(pos, D) + d_cube(v_D, hex_end)
+        其中 v_D 是 C_D 中离 hex_end 最近的代表点（self._road_end）
+        """
+        d_net = self._adsorption_distance_to_C_D(pos)
+        if self._road_end is not None:
+            d_extra = hex_distance(self._road_end, self.hex_end)
         else:
-            return float(hex_distance(pos, self.hex_end))
+            d_extra = hex_distance(pos, self.hex_end)
+        return d_net + d_extra
 
     def get_episode_metadata(self):
-        """Return episode-level metadata needed by HER/EpisodeBuffer.
-
-        Returns a dict with absolute coordinates of origin/destination and the
-        BFS distance field built for this episode (or None if unavailable).
-        """
+        """Return episode-level metadata needed by HER/EpisodeBuffer."""
         return {
             'hex_start': tuple(self.hex_start),
             'hex_end': tuple(self.hex_end),
             'bfs_dist': self._bfs_dist,
             'road_end': self._road_end,
+            'C_D': self._C_D,
         }
 
     def step(self, action: int):
@@ -372,8 +441,10 @@ class PathEnv:
         done = False
         self.step_cnt += 1
 
-        # 计算移动前的距离（路网约束下的有效距离）
-        prev_dist = self._effective_distance_to_goal(self.hex_start)
+        # 移动前的状态
+        pre_move_pos = self.hex_start
+        pre_move_cube_dist = hex_distance(pre_move_pos, self.hex_end)
+        pre_move_eff_dist = self._effective_distance_to_goal(pre_move_pos)
 
         # 更新位置偏移（cube coords）
         dq, dr, ds = HEX_DIRECTIONS[action]
@@ -392,7 +463,6 @@ class PathEnv:
 
         visit_count = self.node_memory.get(pos_key)
         self.state['visit_count'] = visit_count
-        # reward -= min(visit_count * 2, 2)
 
         # 更新绝对坐标
         self.hex_start = hex_add(self.hex_start, HEX_DIRECTIONS[action])
@@ -404,7 +474,6 @@ class PathEnv:
         new_candidate = self.candidate_modes & curr_active_modes
         if (self.candidate_modes or curr_active_modes) and len(new_candidate) == 0:
             self.min_trans_count += 1
-            # reward -= 1
             self.candidate_modes = curr_active_modes.copy()
         else:
             self.candidate_modes = new_candidate
@@ -417,14 +486,19 @@ class PathEnv:
         rem = hex_sub(self.hex_end, self.hex_start)
         self.state['remaining_distance'] = (rem[0], rem[1], rem[2])
 
-        # 更新 BFS 距离
-        self.state['bfs_remaining'] = self._effective_distance_to_goal(self.hex_start)
+        # 移动后的状态
+        curr_eff_dist = self._effective_distance_to_goal(self.hex_start)
+        curr_cube_dist = hex_distance(self.hex_start, self.hex_end)
 
-        # 计算移动后的距离（路网约束下的有效距离）
-        curr_dist = self._effective_distance_to_goal(self.hex_start)
+        self.state['bfs_remaining'] = curr_eff_dist
 
-        # 计算奖励
-        reward = self.calculate_reward(reward, prev_dist, curr_dist, self.neighbor, action)
+        # 计算奖励（势能场公式）
+        reward = self.calculate_reward(
+            reward, pre_move_eff_dist, curr_eff_dist,
+            self.neighbor, action,
+            prev_cube_dist=pre_move_cube_dist,
+            curr_cube_dist=curr_cube_dist
+        )
 
         # 追踪每步是否在路上（self.neighbor 还指向旧位置，ACTION_TO_HEX_IDX 对应目标格子）
         self.on_road_steps += int(self.neighbor[ACTION_TO_HEX_IDX[action]] != 0)
@@ -451,7 +525,7 @@ class PathEnv:
         )
 
         # 判断 done
-        if curr_dist <= self.distance_threshold:
+        if curr_eff_dist <= self.distance_threshold:
             done = True
             success = 1
             match_ratio = self.on_road_steps / max(1, self.step_cnt)

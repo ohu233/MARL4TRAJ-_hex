@@ -319,34 +319,18 @@ def plot_combined_for_id(items, tid, save_dir, mapdata=None):
         ax.plot(mxs, mys, marker='o', markersize=2, color=color,
                 linewidth=1.5, alpha=0.8, zorder=4)
 
-        if mxs:
-            ax.scatter(mxs[0], mys[0], c=color, marker='o', s=30, zorder=5)
-            ax.scatter(mxs[-1], mys[-1], c=color, marker='x', s=30, zorder=5)
-
-        if prev_end is not None:
-            pe = hex_to_mercator(prev_end[0], prev_end[1], prev_end[2])
-            ss = hex_to_mercator(item["start_hex"][0], item["start_hex"][1],
-                                 item["start_hex"][2])
-            if pe is not None and ss is not None:
-                ax.plot([pe[0], ss[0]], [pe[1], ss[1]], linestyle="--",
-                        color="gray", linewidth=1, alpha=0.7, zorder=3)
-        prev_end = item["end_hex"]
-
-    # 首段起点和末段终点高亮
-    first = items[0]
-    last = items[-1]
-    fs = hex_to_mercator(first["start_hex"][0], first["start_hex"][1],
-                          first["start_hex"][2])
-    le = hex_to_mercator(last["end_hex"][0], last["end_hex"][1],
-                          last["end_hex"][2])
-    if fs is not None:
-        ax.scatter(fs[0], fs[1], c=MODE_COLORS.get(first["mode"], "C0"),
-                   marker='o', s=70, edgecolors='red', linewidths=1.5,
-                   zorder=6, label='start')
-    if le is not None:
-        ax.scatter(le[0], le[1], c=MODE_COLORS.get(last["mode"], "C0"),
-                   marker='X', s=80, edgecolors='black', linewidths=1.5,
-                   zorder=6, label='end')
+        # 成功后画终止点到终点的连线
+        if item["success"] == 1:
+            goal = item.get("goal_hex")
+            end = item.get("end_hex")
+            if goal is not None and end is not None:
+                gm = hex_to_mercator(goal[0], goal[1], goal[2])
+                em = hex_to_mercator(end[0], end[1], end[2])
+                if gm is not None and em is not None:
+                    ax.plot([em[0], gm[0]],
+                           [em[1], gm[1]],
+                           linestyle="-", color=color, linewidth=1.5,
+                           alpha=0.8, zorder=5)
 
     ax.set_title(f"ID={tid}, segments={len(items)}")
     ax.legend(fontsize=8, loc='upper right')
@@ -496,6 +480,7 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str,
             "final_dist": float(final_dist),
             "start_hex": hex_start,
             "end_hex": env.hex_start,
+            "goal_hex": hex_end,
             "traj": traj,
             "mode": real_mode,
         })
