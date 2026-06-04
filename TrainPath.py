@@ -245,14 +245,33 @@ if __name__ == "__main__":
 
     shuffled_traj = traj.sample(frac=1, random_state=40).reset_index(drop=True)
     shuffled_traj = shuffled_traj[shuffled_traj['distance_cells'] > 4].reset_index(drop=True)
-    
+
+    # ========== 分层采样：平衡长距离样本比例 ==========
+    # 长距离样本（20+ cells）原本只占约 2.4%，严重不足
+    # 过采样长距离样本，使其在训练中出现更多次
+    long_mask = shuffled_traj['distance_cells'] > 20
+    long_traj = shuffled_traj[long_mask]
+    short_traj = shuffled_traj[~long_mask]
+
+    # 过采样倍数：长距离样本复制 10 倍，使占比从 ~2.4% 提升到 ~20%
+    OVERSAMPLE_RATIO = 10
+    if len(long_traj) > 0:
+        long_traj_oversampled = pd.concat([long_traj] * OVERSAMPLE_RATIO, ignore_index=True)
+        balanced_traj = pd.concat([short_traj, long_traj_oversampled], ignore_index=True)
+    else:
+        balanced_traj = shuffled_traj
+
+    # 打乱顺序，确保长短距离混合
+    balanced_traj = balanced_traj.sample(frac=1, random_state=42).reset_index(drop=True)
+    print(f"[Balanced Sampling] short={len(short_traj)}, long(oversampled {OVERSAMPLE_RATIO}x)={len(long_traj_oversampled) if len(long_traj) > 0 else 0}, total={len(balanced_traj)}")
+
     train_mode = True
     USE_GNN = False
     FOV = 5
     distance_threshold = 1.0
     env = PathEnv(train_mode=train_mode,
                   mapdata=mapdata,
-                  traj=shuffled_traj,
+                  traj=balanced_traj,
                   FOV=FOV,
                   distance_threshold=distance_threshold,
                   bfs_search_radius=30,
