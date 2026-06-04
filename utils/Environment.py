@@ -16,7 +16,6 @@ from utils.hex_utils import (
     HEX_RADIUS, _hex_ring_offsets,
 )
 
-
 """
 1. 多路网环境下避免换乘应该安排在下层PathEnv中实现，而不是ModeEnv中：
     - 安排在上层容易使上层任务耦合过度，奖励设计等趋于复杂
@@ -27,9 +26,7 @@ from utils.hex_utils import (
     - 奖励设计重点考虑（路径长度加权）：综合所选路网匹配度（判断是否匹配）、成功率、速度匹配、最大路网匹配度（或1，2位路网匹配度之差：越大说明越高概率是单模式），换乘次数（错误路网下，换乘次数一般多于正确路网）、模式数量惩罚
 """
 
-
 modelist = ['GSD', 'GG', 'TS', 'TG']
-
 
 class PathEnv:
     '''
