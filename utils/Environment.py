@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 
 from utils.SoftActorCritic import DiscreteSACAgent, SACConfig
-from utils.tools import mapdata_to_modelmatrix, state_to_vector, calculate_match_rate
+from utils.tools import state_to_vector
 from utils.hex_utils import (
     HEX_DIRECTIONS, ACTION_TO_HEX_IDX,
     hex_distance, hex_is_valid, hex_add, hex_sub,
@@ -37,35 +37,22 @@ class PathEnv:
     Test：（协同部署）接收ModeAgent传递的Mode
     '''
     def __init__(self,
-                 selected_mode: np.ndarray = None,
-                 train_mode: bool = True,
-                 curriculum_mode: bool = True,
-                 mapdata: dict = None,
-                 traj: pd.DataFrame = None,
-                 FOV: int = 1,
-                 distance_threshold: float = 1.0,
-                 bfs_search_radius: int = 30,
-                 bfs_max_nodes: int = 50000,
-                 reward_alpha: float = 0.3,
-                 reward_beta: float = 0.7,
-                 adsorption_radius: int = 20,
-                 adsorption_K: int = 5,
-                 max_offroad_streak: int = 8,
-                 max_offroad_ratio: float = 0.6,
-                 min_steps_before_offroad_ratio_check: int = 20,
-                 offroad_streak_penalty: float = 0.4,
-                 recovery_bonus: float = 1.0,
-                 offroad_done_enabled: bool = True,
-                 no_progress_patience: int = 12,
-                 no_progress_penalty: float = 0.3,
-                 min_steps_before_no_progress_check: int = 8,
-                 short_success_match_threshold: float = 0.75,
-                 short_success_step_threshold: int = 4,
+                 selected_mode: np.ndarray = None,                  # 选择的路网
+                 train_mode: bool = True,                           # 训练模式
+                 mapdata: dict = None,                              # 地图数据
+                 traj: pd.DataFrame = None,                         # 轨迹数据
+                 FOV: int = 1,                                      # 观测半径
+                 distance_threshold: float = 1.0,                   # 成功判定的距离阈值
+                 bfs_search_radius: int = 10,                       # BFS 搜索半径
+                 bfs_max_nodes: int = 50000,                        # BFS 距离场最大节点数
+                 reward_alpha: float = 0.3,                         # 势能场 cube 距离变化系数 α·ΔD_cube
+                 reward_beta: float = 0.7,                          # 势能场路网距离变化系数 β·ΔD_net
+                 adsorption_radius: int = 20,                       # 吸附集合 C_D 的搜索半径
+                 adsorption_K: int = 3,                             # C_D 中保留的最近路网点数量
                  ):
 
         self.selected_mode = selected_mode
         self.train_mode = train_mode
-        self.curriculum_mode = curriculum_mode
         self.traj = traj
         self.traj_cnt = 0
         self.FOV = FOV
@@ -75,65 +62,73 @@ class PathEnv:
         self._bfs_dist = None
         self._road_end = None
         self._C_D = None
-        self._bfs_total = 0
 
         # 势能场奖励参数
         self.reward_alpha = reward_alpha
         self.reward_beta = reward_beta
         self.adsorption_radius = adsorption_radius
         self.adsorption_K = adsorption_K
-        self.max_offroad_streak = int(max_offroad_streak)
-        self.max_offroad_ratio = float(max_offroad_ratio)
-        self.min_steps_before_offroad_ratio_check = int(min_steps_before_offroad_ratio_check)
-        self.offroad_streak_penalty = float(offroad_streak_penalty)
-        self.recovery_bonus = float(recovery_bonus)
-        self.offroad_done_enabled = bool(offroad_done_enabled)
-        self.no_progress_patience = int(no_progress_patience)
-        self.no_progress_penalty = float(no_progress_penalty)
-        self.min_steps_before_no_progress_check = int(min_steps_before_no_progress_check)
-        self.short_success_match_threshold = float(short_success_match_threshold)
-        self.short_success_step_threshold = int(short_success_step_threshold)
 
         # 加载 hex 地图数据
-        if mapdata is not None:
-            first_key = next(iter(mapdata)) if mapdata else None
-            if isinstance(first_key, tuple) and len(first_key) == 3:
-                first_val = mapdata[first_key]
-                if isinstance(first_val, dict) and 'code' in first_val:
-                    # 原始 pkl 格式: {(q,r,s): {'lon','lat','code'}}
-                    self.hex_mapdata_raw = mapdata
-                    code_dict = {k: int(v['code']) for k, v in mapdata.items()}
-                    self.mapdata = code_to_mode_matrices(code_dict)
-                elif isinstance(first_val, (int, float, np.integer, np.floating)):
-                    # code-only dict: {(q,r,s) → code}
-                    self.hex_mapdata_raw = None
-                    self.mapdata = code_to_mode_matrices(mapdata)
-                else:
-                    # 已经是 per-mode dict
-                    self.hex_mapdata_raw = None
-                    self.mapdata = mapdata
-            else:
-                raise ValueError(
-                    "PathEnv now requires hex mapdata. "
-                    "Use load_hex_mapdata_raw() to load data/hex_grid.pkl"
-                )
-        else:
-            self.hex_mapdata_raw = None
-            self.mapdata = None
-        self.node_memory = set()
-        self.curriculum_stage = 0
-        self.min_mode_count = 1
-        self.max_mode_count = len(modelist)
+        first_key = next(iter(mapdata)) if mapdata else None
+        first_value = mapdata.get(first_key) if first_key is not None else None
+        if not (
+            isinstance(first_key, tuple)
+            and len(first_key) == 3
+            and isinstance(first_value, dict)
+            and 'code' in first_value
+        ):
+            raise ValueError(
+                "PathEnv requires raw hex mapdata: "
+                "{(q, r, s): {'lon': ..., 'lat': ..., 'code': ...}}"
+            )
+        self.hex_mapdata_raw = mapdata
+        code_dict = {k: int(v['code']) for k, v in mapdata.items()}
+        self.mapdata = code_to_mode_matrices(code_dict)
+
         if self.selected_mode is None:
             self.selected_mode = np.array(modelist)
+        self.min_mode_count = 1
+        self.max_mode_count = len(modelist)
 
-    def _patch_or_zero(self, mode, q, r, s):
+    def _patch_or_zero(self, mode, q, r, s) -> np.ndarray:
         """未选中的 mode 返回全零 FOV，避免噪声干扰。"""
         if mode in self.selected_mode:
             return get_hex_neighborhood(self.mapdata[mode], q, r, s, radius=self.FOV)
         else:
-            n_cells = 3 * self.FOV**2 + 3 * self.FOV + 1
+            n_cells = 3 * self.FOV**2 + 3 * self.FOV + 1    # FOV内栅格数量
+
             return np.zeros(n_cells, dtype=np.float32)
+
+    def _bfs_gradient_patch(self, pos) -> np.ndarray:
+        """Return a local BFS descent field aligned with the hex patch ordering."""
+        pos_key = (int(round(pos[0])), int(round(pos[1])), int(round(pos[2])))
+        current_dist = self._adsorption_distance_to_C_D(pos_key)
+        values = []
+
+        for ring_r in range(self.FOV + 1):
+            for dq, dr, ds in _hex_ring_offsets(ring_r):
+                key = (pos_key[0] + dq, pos_key[1] + dr, pos_key[2] + ds)
+                if self.multi_mapdata.get(key, 0) == 0 or self._bfs_dist is None:
+                    values.append(-1.0)
+                    continue
+                cell_dist = self._bfs_dist.get(key)
+                if cell_dist is None:
+                    values.append(-1.0)
+                    continue
+                values.append(float(np.clip(current_dist - cell_dist, -1.0, 1.0)))
+
+        return np.asarray(values, dtype=np.float32)
+
+    def _build_patch(self, pos) -> list:
+        return (
+            get_hex_neighborhood(self.multi_mapdata, *pos, radius=self.FOV).tolist() +
+            self._patch_or_zero('GSD', *pos).tolist() +
+            self._patch_or_zero('GG', *pos).tolist() +
+            self._patch_or_zero('TS', *pos).tolist() +
+            self._patch_or_zero('TG', *pos).tolist() +
+            self._bfs_gradient_patch(pos).tolist()
+        )
 
     def reset(self):
 
@@ -144,12 +139,11 @@ class PathEnv:
 
         # 训练模式下随机选择 mode 组合（必然包含真实mode）
         if self.train_mode:
-            max_modes = self.max_mode_count if self.curriculum_mode else len(modelist)
-            max_modes = max(1, min(max_modes, len(modelist)))
-            min_modes = max(1, min(self.min_mode_count, max_modes))
-            num_modes = np.random.randint(min_modes, max_modes + 1)
+            num_modes = np.random.randint(self.min_mode_count, self.max_mode_count + 1)
+            # 获取真实mode
             real_mode = str(self.traj.loc[current_traj_idx, 'mode']).strip()
             if real_mode in modelist:
+                # 确保真实mode在可选模式中，并从全量模式中随机选择其他模式
                 remaining_modes = [m for m in modelist if m != real_mode]
                 extra_num = min(num_modes - 1, len(remaining_modes))
                 extra_modes = np.random.choice(remaining_modes, size=max(0, extra_num), replace=False)
@@ -166,16 +160,17 @@ class PathEnv:
         # 读取起点/终点 cube 坐标
         row = self.traj.iloc[current_traj_idx]
         hex_start, hex_end = self._read_hex_coords(row)
+        # 获取栅格距离
         if 'distance_cells' in row:
             self.episode_distance_cells = float(row['distance_cells'])
-        else:
+        else:   # 避免字段缺失
             self.episode_distance_cells = float(hex_distance(hex_start, hex_end))
 
         self.hex_start = hex_start
         self.hex_end = hex_end
 
         # 构建 multi_mapdata（dict 合并）
-        self.multi_mapdata = {}
+        self.multi_mapdata = {} # (x, y, z) = 1
         for mode in self.selected_mode:
             mode_dict = self.mapdata[mode]
             for cube in mode_dict:
@@ -195,16 +190,10 @@ class PathEnv:
             max_radius=self.adsorption_radius,
             K=self.adsorption_K
         )
-        # 如果半径内不足 K 个，扩大搜索
-        if len(cd_candidates) < self.adsorption_K:
-            cd_candidates = find_k_nearest_road_cells(
-                *hex_end, self.multi_mapdata,
-                max_radius=self.bfs_search_radius,
-                K=self.adsorption_K
-            )
+        # 获取多源距离场 源的hex coods
         self._C_D = [c for c in cd_candidates if self.multi_mapdata.get(c, 0) != 0]
 
-        # 从 C_D 多源 BFS 构建路网距离场
+        # 从 C_D 多源 BFS 构建路网距离场：dict
         if self._C_D:
             self._bfs_dist = build_bfs_distance_field_from_multiple(
                 self._C_D, self.multi_mapdata, max_nodes=self.bfs_max_nodes
@@ -214,72 +203,41 @@ class PathEnv:
 
         # 计算 max_step：优先用路网约束下的有效距离
         if road_start is not None and self._bfs_dist is not None and road_start in self._bfs_dist:
+            # 有效距离=起点到最近路网距离+多源距离场距离+终点到最近路网距离
             eff_dist = (
                 hex_distance(hex_start, road_start)
                 + self._bfs_dist[road_start]
                 + hex_distance(self._road_end, hex_end)
             )
+            # 最大步数设定为有效距离的3倍
             self.max_step = max(1, int(eff_dist * 3))
-            self._bfs_total = int(self._bfs_dist[road_start] + hex_distance(self._road_end, hex_end))
         else:
             h_dist = hex_distance(hex_start, hex_end)
             self.max_step = max(1, int(h_dist * 3))
-            self._bfs_total = int(h_dist)
 
         # neighbor: 半径1六边形邻域
         self.neighbor = get_hex_neighborhood(
             self.multi_mapdata, hex_start[0], hex_start[1], hex_start[2], radius=1
         )
-        initial_eff_dist = self._effective_distance_to_goal(hex_start)
+        initial_bfs_dist = self._adsorption_distance_to_C_D(hex_start)
+        self.initial_bfs_distance = max(1.0, float(initial_bfs_dist))
 
         self.traj_cnt += 1
-
-        # 引入 Node Memory
-        self.node_memory = dict()
 
         # 计算剩余距离 cube 偏移
         rem = hex_sub(hex_end, hex_start)  # (dq, dr, ds)
 
         self.state = {
-            'current_position': np.array([0, 0, 0]),  # cube 偏移
             'remaining_distance': np.array(rem),       # cube 偏移
             'previous_remaining_distance': np.array(rem),
-            'total_distance': np.array(rem),           # 总偏移（定值）
-            'bfs_remaining': initial_eff_dist,
-            'bfs_total': float(self._bfs_total),
+            'normalized_bfs_remaining': float(initial_bfs_dist) / self.initial_bfs_distance,
             'current_mode': self.selected_mode,
-            'patch': (
-                get_hex_neighborhood(self.multi_mapdata, *hex_start, radius=self.FOV).tolist() +
-                self._patch_or_zero('GSD', *hex_start).tolist() +
-                self._patch_or_zero('GG', *hex_start).tolist() +
-                self._patch_or_zero('TS', *hex_start).tolist() +
-                self._patch_or_zero('TG', *hex_start).tolist()
-            ),
-            'visit_count': 0,
-            'candidate_modes': set(),
-            'offroad_streak': 0,
-            'offroad_total': 0,
-            'offroad_ratio': 0.0,
-            'best_bfs_remaining': float(initial_eff_dist),
-            'no_progress_steps': 0,
-            'done_reason': 'running',
+            'patch': self._build_patch(hex_start),
         }
 
-        start_modes = {
-            mode for mode in self.selected_mode
-            if self._get_map_value(mode, *hex_start) == 1
-        }
-        self.candidate_modes = start_modes.copy()
-        self.state['candidate_modes'] = self.candidate_modes
-        self.min_trans_count = 0
-        self.on_road_steps = 0
-        self.offroad_streak = 0
-        self.offroad_streak_max = 0
-        self.offroad_total = 0
-        self.best_bfs_remaining = float(initial_eff_dist)
-        self.no_progress_steps = 0
-        self.done_reason = 'running'
-        self.prev_action = None
+        self.visited_points = 1
+        self.on_road_points = int(self._is_on_selected_road(hex_start))
+        self.match_ratio = self.on_road_points / self.visited_points
 
         return self.state
 
@@ -288,12 +246,13 @@ class PathEnv:
         CSV 的 loczo/loczd 由三个分量独立 round 生成，可能违反 q+r+s=0。
         这里用 q/r 重新推导 s，与 hex_grid.pkl 保持一致。
         """
-        locxo = float(row['locxo'])
-        locyo = float(row['locyo'])
-        locxd = float(row['locxd'])
-        locyd = float(row['locyd'])
-        loczo = -(locxo + locyo)
-        loczd = -(locxd + locyd)
+        locxo = int(row['locxo'])
+        locyo = int(row['locyo'])
+        locxd = int(row['locxd'])
+        locyd = int(row['locyd'])
+        # 确保q+r+s=0
+        loczo = int(-(locxo + locyo))
+        loczd = int(-(locxd + locyd))
 
         return (locxo, locyo, loczo), (locxd, locyd, loczd)
 
@@ -332,52 +291,9 @@ class PathEnv:
         key = (int(round(q)), int(round(r)), int(round(s)))
         return self.mapdata[mode].get(key, 0)
 
-    def split_traj_by_distance(self, distance_bins=None):
-        """
-        按距离分段（用于课程学习）。
-
-        distance_bins:
-          - int → pd.qcut 均分为 N 段
-          - list → pd.cut 按给定边界分段，如 [0, 4, 8, 12, 100]
-          - None → 不分段，返回全部数据
-        """
-        if self.traj is None or len(self.traj) == 0:
-            return [self.traj]
-
-        if distance_bins is None:
-            return [self.traj.copy().reset_index(drop=True)]
-
-        required_cols = {'locxo', 'locyo', 'loczo', 'locxd', 'locyd', 'loczd'}
-        if not required_cols.issubset(self.traj.columns):
-            raise ValueError(f"Trajectory dataframe missing required columns: {required_cols}")
-
-        df = self.traj.copy().reset_index(drop=True)
-        df['_dist'] = df.apply(
-            lambda r: hex_distance(
-                (r['locxo'], r['locyo'], r['loczo']),
-                (r['locxd'], r['locyd'], r['loczd']),
-            ), axis=1
-        )
-
-        if isinstance(distance_bins, int):
-            sid = pd.qcut(df['_dist'], q=distance_bins, labels=False)
-        else:
-            sid = pd.cut(df['_dist'], bins=distance_bins, labels=False, include_lowest=True)
-        df['_sid'] = sid.astype(int)
-
-        stage_trajs = []
-        for stage_id in sorted(df['_sid'].unique().tolist()):
-            stage_df = df[df['_sid'] == stage_id].drop(columns=['_dist', '_sid']).reset_index(drop=True)
-            stage_trajs.append(stage_df)
-
-        return stage_trajs
-
-    def set_curriculum_stage(self, stage_idx: int, traj_subset: pd.DataFrame = None, max_mode_count: int = 4):
-        self.curriculum_stage = int(stage_idx)
-        self.max_mode_count = max(1, min(int(max_mode_count), len(modelist)))
-        if traj_subset is not None:
-            self.traj = traj_subset.reset_index(drop=True)
-            self.traj_cnt = 0
+    def _is_on_selected_road(self, pos):
+        key = (int(round(pos[0])), int(round(pos[1])), int(round(pos[2])))
+        return self.multi_mapdata.get(key, 0) != 0
 
     def set_mode_sampling_range(self, min_mode_count: int = 1, max_mode_count: int = 4):
         self.min_mode_count = max(1, min(int(min_mode_count), len(modelist)))
@@ -386,8 +302,7 @@ class PathEnv:
             self.min_mode_count = self.max_mode_count
 
     def calculate_reward(self, reward, prev_dist, curr_dist, neighbor, action,
-                         prev_cube_dist=None, curr_cube_dist=None,
-                         was_offroad_before=False):
+                         prev_cube_dist=None, curr_cube_dist=None):
         """
         势能场奖励：R_dist = α·ΔD_cube + β·ΔD_net
 
@@ -405,24 +320,15 @@ class PathEnv:
 
         is_on_road = neighbor[ACTION_TO_HEX_IDX[action]] != 0
 
-        r_dist = self.reward_alpha * delta_cube + self.reward_beta * delta_net
+        r_dist_cube = self.reward_alpha * delta_cube
+        r_dist_net = self.reward_beta * delta_net
 
-        if delta_cube + delta_net > 0:
+        reward += r_dist_cube + r_dist_net
+
+        if is_on_road:
             reward += 1.0
-            reward += 0.8 if is_on_road else -2.5
         else:
-            reward -= 1.0
-            reward += 1.0 if is_on_road else -3.0
-
-        reward += r_dist
-        if is_on_road and delta_net > 0:
-            reward += 0.5 * delta_net
-        elif is_on_road and delta_net <= 0:
-            reward -= 0.5
-        if is_on_road and was_offroad_before:
-            reward += self.recovery_bonus
-        if not is_on_road:
-            reward -= self.offroad_streak_penalty * max(1, self.offroad_streak)
+            reward -= 3.0
 
         return reward
 
@@ -492,42 +398,14 @@ class PathEnv:
         # 移动前的状态
         pre_move_pos = self.hex_start
         pre_move_cube_dist = hex_distance(pre_move_pos, self.hex_end)
-        pre_move_eff_dist = self._effective_distance_to_goal(pre_move_pos)
-        action_target_on_road = self.neighbor[ACTION_TO_HEX_IDX[action]] != 0
-        was_offroad_before = self.offroad_streak > 0
-
-        # 更新位置偏移（cube coords）
-        dq, dr, ds = HEX_DIRECTIONS[action]
-        self.state['current_position'] = (
-            self.state['current_position'][0] + dq,
-            self.state['current_position'][1] + dr,
-            self.state['current_position'][2] + ds,
-        )
-
-        # 更新节点记忆
-        pos_key = tuple(self.state['current_position'])
-        if pos_key in self.node_memory:
-            self.node_memory[pos_key] += 1
-        else:
-            self.node_memory[pos_key] = 1
-
-        visit_count = self.node_memory.get(pos_key)
-        self.state['visit_count'] = visit_count
+        pre_move_bfs_dist = self._adsorption_distance_to_C_D(pre_move_pos)
 
         # 更新绝对坐标
         self.hex_start = hex_add(self.hex_start, HEX_DIRECTIONS[action])
 
-        curr_active_modes = {
-            mode for mode in self.selected_mode
-            if self._get_map_value(mode, *self.hex_start) == 1
-        }
-        new_candidate = self.candidate_modes & curr_active_modes
-        if (self.candidate_modes or curr_active_modes) and len(new_candidate) == 0:
-            self.min_trans_count += 1
-            self.candidate_modes = curr_active_modes.copy()
-        else:
-            self.candidate_modes = new_candidate
-        self.state['candidate_modes'] = self.candidate_modes
+        self.visited_points += 1
+        self.on_road_points += int(self._is_on_selected_road(self.hex_start))
+        self.match_ratio = self.on_road_points / self.visited_points
 
         # 更新上一步剩余距离向量
         self.state['previous_remaining_distance'] = self.state['remaining_distance']
@@ -537,114 +415,35 @@ class PathEnv:
         self.state['remaining_distance'] = (rem[0], rem[1], rem[2])
 
         # 移动后的状态
-        curr_eff_dist = self._effective_distance_to_goal(self.hex_start)
+        curr_bfs_dist = self._adsorption_distance_to_C_D(self.hex_start)
         curr_cube_dist = hex_distance(self.hex_start, self.hex_end)
 
-        self.state['bfs_remaining'] = curr_eff_dist
-
-        if action_target_on_road:
-            self.offroad_streak = 0
-            self.on_road_steps += 1
-        else:
-            self.offroad_streak += 1
-            self.offroad_total += 1
-            self.offroad_streak_max = max(self.offroad_streak_max, self.offroad_streak)
-
-        offroad_ratio = self.offroad_total / max(1, self.step_cnt)
-        self.state['offroad_streak'] = int(self.offroad_streak)
-        self.state['offroad_total'] = int(self.offroad_total)
-        self.state['offroad_ratio'] = float(offroad_ratio)
-
-        if curr_eff_dist < self.best_bfs_remaining:
-            self.best_bfs_remaining = float(curr_eff_dist)
-            self.no_progress_steps = 0
-        else:
-            self.no_progress_steps += 1
-            reward -= self.no_progress_penalty
-        self.state['best_bfs_remaining'] = float(self.best_bfs_remaining)
-        self.state['no_progress_steps'] = int(self.no_progress_steps)
+        self.state['normalized_bfs_remaining'] = (
+            float(curr_bfs_dist) / self.initial_bfs_distance
+        )
 
         # 计算奖励（势能场公式）
         reward = self.calculate_reward(
-            reward, pre_move_eff_dist, curr_eff_dist,
+            reward, pre_move_bfs_dist, curr_bfs_dist,
             self.neighbor, action,
             prev_cube_dist=pre_move_cube_dist,
             curr_cube_dist=curr_cube_dist,
-            was_offroad_before=was_offroad_before
         )
-
-        # TODO：删除：方向连续性：直行奖励，掉头惩罚
-        if self.prev_action is not None:
-            diff = min((action - self.prev_action) % 6, (self.prev_action - action) % 6)
-            if diff == 0 and curr_eff_dist <= pre_move_eff_dist:
-                reward += 0.15      # 直行
-            elif diff == 3:
-                reward -= 0.3       # 180° 掉头
-        self.prev_action = action
 
         # 更新 neighbor
         self.neighbor = get_hex_neighborhood(
             self.multi_mapdata, *self.hex_start, radius=1
         )
-        self.state['patch'] = (
-            get_hex_neighborhood(self.multi_mapdata, *self.hex_start, radius=self.FOV).tolist() +
-            self._patch_or_zero('GSD', *self.hex_start).tolist() +
-            self._patch_or_zero('GG', *self.hex_start).tolist() +
-            self._patch_or_zero('TS', *self.hex_start).tolist() +
-            self._patch_or_zero('TG', *self.hex_start).tolist()
-        )
+        self.state['patch'] = self._build_patch(self.hex_start)
 
         # 判断 done
-        if curr_eff_dist <= self.distance_threshold:
-            match_ratio = self.on_road_steps / max(1, self.step_cnt)
-            near_goal_on_road = self.multi_mapdata.get(
-                (int(round(self.hex_start[0])), int(round(self.hex_start[1])), int(round(self.hex_start[2]))),
-                0
-            ) != 0
-            near_goal_adsorbed = self.offroad_streak <= 1 and offroad_ratio <= 0.5
-            if near_goal_on_road or near_goal_adsorbed:
-                done = True
-                success = 1
-                self.done_reason = 'success'
-                # 路径长度无关的 terminal bonus：固定 match 奖励 + 固定成功奖励
-                # 避免 agent 学会"绕远点拿更多 step_cnt*match_ratio"
-                reward += 30.0 * match_ratio + 20.0
-            else:
-                done = True
-                self.done_reason = 'near_goal_offroad'
-                reward -= 20.0 * (1.0 - match_ratio)
-        elif self.offroad_done_enabled and self.offroad_streak >= self.max_offroad_streak:
+        if self._is_on_selected_road(self.hex_start) and curr_bfs_dist <= self.distance_threshold:
+            reward += 50.0 * self.match_ratio
             done = True
-            self.done_reason = 'offroad_streak'
-            reward -= 20.0 + self.offroad_streak * self.offroad_streak_penalty
-        elif (
-            self.offroad_done_enabled
-            and self.step_cnt >= self.min_steps_before_no_progress_check
-            and self.no_progress_steps >= self.no_progress_patience
-        ):
-            done = True
-            self.done_reason = 'no_progress'
-            reward -= 20.0 + self.no_progress_steps * self.no_progress_penalty
-        elif (
-            self.offroad_done_enabled
-            and self.step_cnt >= self.min_steps_before_offroad_ratio_check
-            and offroad_ratio > self.max_offroad_ratio
-        ):
-            done = True
-            self.done_reason = 'offroad_ratio'
-            reward -= 20.0 + self.step_cnt * offroad_ratio
+            success = 1
         elif self.step_cnt >= self.max_step:
+            reward -= 20.0 * (1.0 - self.match_ratio)
             done = True
-            self.done_reason = 'max_step'
-            reward -= self.step_cnt
-        else:
-            done = False
-            self.done_reason = 'running'
-
-        self.state['offroad_streak'] = int(self.offroad_streak)
-        self.state['offroad_total'] = int(self.offroad_total)
-        self.state['offroad_ratio'] = float(offroad_ratio)
-        self.state['done_reason'] = self.done_reason
 
         return self.state, reward, done, success
 
@@ -703,8 +502,8 @@ class ModeEnv:
         cfg = SACConfig()
         device = torch.device(cfg.device)
 
-        path_agent = DiscreteSACAgent(vec_dim=23, hex_radius=self.fov, action_dim=6,
-                                       cfg=cfg, use_gnn=True, in_channels=5)
+        path_agent = DiscreteSACAgent(vec_dim=11, hex_radius=self.fov, action_dim=6,
+                                       cfg=cfg, use_gnn=True, in_channels=6)
         state_dict = torch.load(self.model_path, map_location=device)
         path_agent.actor.load_state_dict(state_dict)
         path_agent.actor.eval()
@@ -763,21 +562,21 @@ class ModeEnv:
 
     def _run_PathMode(self, selected_modes):
         traj_one = self.current_row.reset_index(drop=True)
+        if self.hex_mapdata_raw is None:
+            raise ValueError("ModeEnv requires raw hex mapdata to create PathEnv.")
 
         env = PathEnv(
             train_mode=False,
             selected_mode=np.array(selected_modes),
-            mapdata=self.mapdata,
+            mapdata=self.hex_mapdata_raw,
             traj=traj_one,
             FOV=self.fov,
             distance_threshold=self.distance_threshold,
         )
-        env.hex_mapdata_raw = getattr(self, 'hex_mapdata_raw', None)
 
         s = env.reset()
         traj_points = [(env.hex_start[0], env.hex_start[1], env.hex_start[2])]
         steps = 0
-        trans_times = 0
         success = 0
         done = False
 
@@ -793,36 +592,7 @@ class ModeEnv:
 
         path_len = float(steps)
 
-        # trans_times 计算
-        trans_times = 0
-        candidate_modes = None
-        NO_MODE = "__NO_MODE__"
-
-        _mode_maps = {m: self.mapdata[m] for m in selected_modes}
-
-        for p in traj_points:
-            if p is None or len(p) < 3:
-                continue
-            q, r, s = int(round(p[0])), int(round(p[1])), int(round(p[2]))
-            key = (q, r, s)
-            curr_modes = {m for m in selected_modes if _mode_maps[m].get(key, 0) != 0}
-
-            if not curr_modes:
-                curr_modes = {NO_MODE}
-
-            if candidate_modes is None:
-                candidate_modes = set(curr_modes)
-                continue
-
-            candidate_modes &= curr_modes
-            if len(candidate_modes) == 0:
-                trans_times += 1
-                candidate_modes = set(curr_modes)
-
-        multi_match_rate = float(calculate_match_rate(
-            [(p[0], p[1], p[2]) for p in traj_points],
-            env.multi_mapdata,
-        ))
+        multi_match_rate = float(env.match_ratio)
 
         selected_set = set(selected_modes)
         mode_scores = {m: 0.0 for m in modelist}
@@ -845,7 +615,7 @@ class ModeEnv:
             else:
                 match_rate.append(0.0)
 
-        return match_rate, multi_match_rate, success, steps, path_len, trans_times
+        return match_rate, multi_match_rate, success, steps, path_len
 
     def reset(self):
         idx = self.traj_cnt % len(self.traj)
@@ -868,7 +638,6 @@ class ModeEnv:
                 "time": 0,
                 "distance": 0,
                 "velocity": 0,
-                "trans_times": 0,
             },
             "current": {
                 "mode": init_mode_mask,
@@ -880,7 +649,6 @@ class ModeEnv:
                 "time": 0,
                 "distance": 0,
                 "velocity": 0,
-                "trans_times": 0,
             }
         }
 
@@ -916,7 +684,7 @@ class ModeEnv:
         else:
             self.no_change_streak += 1
 
-        match_rate, multi_match_rate, success, steps, path_len, trans_times = self._run_PathMode(selected_modes)
+        match_rate, multi_match_rate, success, steps, path_len = self._run_PathMode(selected_modes)
 
         reward += 0.2 * success
         reward += multi_match_rate if multi_match_rate >= 0.6 else -1
@@ -927,7 +695,6 @@ class ModeEnv:
 
         reward += max(match_rate)
         reward -= min(0.5 * cur_mask.sum(), 5)
-        reward -= min(0.5 * trans_times, 5)
         reward += self._speed_deviation_reward(cur_mask, velocity)
 
         self.state["current"] = {
@@ -940,7 +707,6 @@ class ModeEnv:
             "time": time,
             "distance": distance,
             "velocity": velocity,
-            "trans_times": trans_times,
         }
 
         if self.no_change_streak >= self.no_change_patience:
@@ -973,7 +739,6 @@ if __name__ == "__main__":
         print("====== PathEnv 环境检测 ======")
         print(f"  FOV: {pathenv.FOV}")
         print(f"  train_mode: {pathenv.train_mode}")
-        print(f"  curriculum_mode: {pathenv.curriculum_mode}")
         print(f"  轨迹数量: {len(pathenv.traj)}")
 
         # ====== 单次 reset 检测 ======
@@ -987,23 +752,26 @@ if __name__ == "__main__":
 
         # 检查 state 各字段
         print(f"\n  state keys: {list(state.keys())}")
-        for k in ['current_position', 'remaining_distance', 'total_distance']:
+        for k in ['remaining_distance', 'previous_remaining_distance']:
             v = state[k]
             print(f"  {k}: shape={np.array(v).shape}, value={v}")
-        for k in ['current_mode', 'candidate_modes', 'visit_count']:
+        for k in ['current_mode', 'normalized_bfs_remaining']:
             print(f"  {k}: {state[k]}")
 
         patch = np.array(state['patch'])
         n_cells = 3 * pathenv.FOV**2 + 3 * pathenv.FOV + 1
-        print(f"  patch: shape={patch.shape}, expected 5×{n_cells}={5*n_cells}")
-        assert patch.shape == (5 * n_cells,), \
-            f"patch shape mismatch: {patch.shape} != ({5 * n_cells},)"
+        print(f"  patch: shape={patch.shape}, expected 6×{n_cells}={6*n_cells}")
+        assert patch.shape == (6 * n_cells,), \
+            f"patch shape mismatch: {patch.shape} != ({6 * n_cells},)"
         print(f"  patch[0:{n_cells}] (multi) 非零数: {np.count_nonzero(patch[:n_cells])}")
-        for i, m in enumerate(['TG', 'GG', 'GSD', 'TS'], 1):
+        for i, m in enumerate(['GSD', 'GG', 'TS', 'TG'], 1):
             ch = patch[i*n_cells:(i+1)*n_cells]
             nonzero = np.count_nonzero(ch)
             active = "✓" if m in pathenv.selected_mode else "✗(zero)"
             print(f"  patch[{i}*{n_cells}:] ({m}): 非零数={nonzero}, active={active}")
+        bfs_patch = patch[5*n_cells:6*n_cells]
+        print(f"  patch[5*{n_cells}:] (BFS gradient): "
+              f"min={bfs_patch.min():.1f}, max={bfs_patch.max():.1f}")
 
         # neighbor 检查
         print(f"\n  neighbor (radius=1): {pathenv.neighbor}")
@@ -1041,7 +809,7 @@ if __name__ == "__main__":
             final_dist = hex_distance(pathenv.hex_start, pathenv.hex_end)
             print(f"  Ep {ep+1}: steps={step}, reward={total_reward:.1f}, "
                   f"success={succ}, final_dist={final_dist}, "
-                  f"mode={pathenv.selected_mode}, trans={pathenv.min_trans_count}")
+                  f"mode={pathenv.selected_mode}, match={pathenv.match_ratio:.3f}")
 
         print(f"\n====== 环境检测完成 ======")
 

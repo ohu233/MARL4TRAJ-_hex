@@ -19,15 +19,15 @@ import numpy as np
 HEX_RADIUS = 199            # max cube distance from hex center
 
 # 平顶六边形 6 个方向（cube 坐标偏移量），坐标轴穿过节点
-# 正右方为x轴正方向，逆时针120度为z轴正方向，剩下的y轴满足 q+r+s=0
+# 正动方为x轴正方向，逆时针120度为z轴正方向，然后是y轴，z轴满足 q+r+s=0
 # 动作编号逆时针从正北开始，每60度一个方向: 0=北, 1=西北, 2=西南, 3=南, 4=东南, 5=东北
 HEX_DIRECTIONS = [
-    (+1, -1,  0),   # 0: 北 North
-    ( 0, -1, +1),   # 1: 西北 Northwest
-    (-1,  0, +1),   # 2: 西南 Southwest
-    (-1, +1,  0),   # 3: 南 South
-    ( 0, +1, -1),   # 4: 东南 Southeast
-    (+1,  0, -1),   # 5: 东北 Northeast
+    (0, -1, +1),   # 0: 北 North
+    (-1, 0, +1),   # 1: 西北 Northwest
+    (-1, +1, 0),   # 2: 西南 Southwest
+    (0, +1, -1),   # 3: 南 South
+    (+1, 0, -1),   # 4: 东南 Southeast
+    (+1, -1, 0),   # 5: 东北 Northeast
 ]
 
 # action → radius-1 邻域中的索引
@@ -73,7 +73,7 @@ def hex_neighbors(q, r, s):
 # ============================================================
 # BFS 路网距离场
 # ============================================================
-def find_nearest_road_cell(center_q, center_r, center_s, mapdata_dict, max_radius=30):
+def find_nearest_road_cell(center_q, center_r, center_s, mapdata_dict, max_radius=30) -> tuple:
     """
     以 (center_q, center_r, center_s) 为中心，逐环搜索最近的路网 cell。
 
@@ -113,6 +113,7 @@ def find_k_nearest_road_cells(center_q, center_r, center_s, mapdata_dict,
             key = (center_q + dq, center_r + dr, center_s + ds)
             if mapdata_dict.get(key, 0) != 0:
                 candidates.append((key, ring_r))
+            # K*3作为候选池大小，用于后续排序和筛选
             if len(candidates) >= K * 3:
                 break
         if len(candidates) >= K * 3:
@@ -151,7 +152,7 @@ def build_bfs_distance_field(start_q, start_r, start_s, mapdata_dict, max_nodes=
     return dist
 
 
-def build_bfs_distance_field_from_multiple(start_points, mapdata_dict, max_nodes=50000):
+def build_bfs_distance_field_from_multiple(start_points: list, mapdata_dict, max_nodes=500000) -> dict:
     """
     从多个起点出发构建联合BFS距离场。
 
@@ -163,32 +164,38 @@ def build_bfs_distance_field_from_multiple(start_points, mapdata_dict, max_nodes
     返回:
         dict: {(q, r, s) → bfs_steps}，从最近起点到该 cell 的最短步数
     """
+    # 空起点列表直接返回空 dict
     if not start_points:
         return {}
 
     valid_starts = []
+    # 将起点列表过滤为有效的路网起点
     for sp in start_points:
-        sp_key = (int(round(sp[0])), int(round(sp[1])), int(round(sp[2])))
+        sp_key = (sp[0], sp[1], sp[2])
         if mapdata_dict.get(sp_key, 0) != 0 and sp_key not in valid_starts:
             valid_starts.append(sp_key)
-
+    # 如果没有有效起点，返回空 dict
     if not valid_starts:
         return {}
 
+    # 初始化dist为0的dict，队列中包含所有有效起点
     dist = {sp: 0 for sp in valid_starts}
+    # 构建长度为 valid_starts 的队列，初始包含所有有效起点
     queue = deque(valid_starts)
 
     while queue and len(dist) < max_nodes:
         cur = queue.popleft()
         for nb in hex_neighbors(*cur):
+            # 如果nb未访问且在路网上，添加到dist和队列
             if nb not in dist and mapdata_dict.get(nb, 0) != 0:
                 dist[nb] = dist[cur] + 1
                 queue.append(nb)
+
     return dist
 
 
 # ============================================================
-# 六边形邻域生成（替代原 get_patch）
+# 六边形邻域生成
 # ============================================================
 def _hex_ring_offsets(radius):
     """
@@ -200,8 +207,8 @@ def _hex_ring_offsets(radius):
     offsets = []
     # 起始点：北侧节点 (dir0 * radius)
     d_start = HEX_DIRECTIONS[0]  # (+1, -1, 0) = 北
-    q, r, s = d_start[0] * radius, d_start[1] * radius, d_start[2] * radius
-    # 逆时针走边顺序: dir2→dir3→dir4→dir5→dir0→dir1
+    q, r, s = d_start[0] * radius, d_start[1] * radius, d_start[2] * radius # 所在环的正北栅格
+    # 逆时针走边顺序：从北侧点出发，沿 ring 的 6 条边绕回起点
     edge_order = [2, 3, 4, 5, 0, 1]
     for d_idx in edge_order:
         dq, dr, ds = HEX_DIRECTIONS[d_idx]
@@ -210,6 +217,7 @@ def _hex_ring_offsets(radius):
             q += dq
             r += dr
             s += ds
+
     return offsets
 
 

@@ -6,7 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.hex_utils import get_fixed_edge_index, hex_distance, ACTION_TO_HEX_IDX
+from utils.hex_utils import (
+    get_fixed_edge_index, hex_distance, ACTION_TO_HEX_IDX, _hex_ring_offsets,
+)
 
 
 # ============================================================
@@ -35,7 +37,7 @@ class HexGraphConv(nn.Module):
 class HexPatchEncoder(nn.Module):
     """将六边形 patch 编码为固定维度向量。"""
 
-    def __init__(self, in_channels: int = 5, hidden_dim: int = 32,
+    def __init__(self, in_channels: int = 6, hidden_dim: int = 32,
                  out_dim: int = 64, num_layers: int = 2,
                  n_nodes: int = 37):
         super().__init__()
@@ -146,14 +148,14 @@ class EpisodeBuffer:
         achieved_goals = []
         for t in transitions:
             s = t[0]
-            cp = s[0:3]
-            achieved_goals.append(_offset_to_abs(cp, hex_start))
+            remaining = s[0:3]
+            achieved_goals.append(_remaining_to_abs(remaining, hex_end))
         # Also include the final next_state's absolute position
         if transitions:
             last_t = transitions[-1]
             ns = last_t[3]
-            np_offset = ns[0:3]
-            achieved_goals.append(_offset_to_abs(np_offset, hex_start))
+            remaining = ns[0:3]
+            achieved_goals.append(_remaining_to_abs(remaining, hex_end))
 
         self.episodes.append({
             'transitions': transitions,
@@ -223,57 +225,46 @@ class EpisodeBuffer:
         hex_start = ep['hex_start']
         bfs_dist = ep['bfs_dist']
 
-        # Recover absolute positions from offsets
-        cur_offset = s[0:3]
-        prev_offset = s[6:9]
-        next_offset = ns[0:3]
-        cur_abs = _offset_to_abs(cur_offset, hex_start)
-        prev_abs = _offset_to_abs(prev_offset, hex_start)
-        next_abs = _offset_to_abs(next_offset, hex_start)
+        # Recover absolute positions from remaining-distance vectors.
+        cur_abs = _remaining_to_abs(s[0:3], ep['hex_end'])
+        prev_abs = _remaining_to_abs(s[3:6], ep['hex_end'])
+        next_abs = _remaining_to_abs(ns[0:3], ep['hex_end'])
 
-        # New cube-offset fields to the fake goal
+        # New remaining-distance fields to the fake goal
         new_remaining = _hex_sub(new_goal, cur_abs)
         new_prev_remaining = _hex_sub(new_goal, prev_abs)  # offset from previous pos to new goal
-        new_total = _hex_sub(new_goal, hex_start)
         new_next_remaining = _hex_sub(new_goal, next_abs)
         new_next_prev_remaining = _hex_sub(new_goal, cur_abs)  # for next state, prev = current
 
-        # New BFS distances (fallback to hex_distance if bfs_dist is None)
+        # New normalized BFS distance (fallback to hex distance because BFS fields are not stored).
         new_cur_bfs = _lookup_bfs(cur_abs, new_goal, bfs_dist, hex_end=ep['hex_end'])
         new_total_bfs = _lookup_bfs(hex_start, new_goal, bfs_dist, hex_end=ep['hex_end'])
-        new_progress = 1.0 - new_cur_bfs / max(1.0, new_total_bfs)
         new_next_bfs = _lookup_bfs(next_abs, new_goal, bfs_dist, hex_end=ep['hex_end'])
-        new_next_progress = 1.0 - new_next_bfs / max(1.0, new_total_bfs)
+        new_cur_normalized = new_cur_bfs / max(1.0, new_total_bfs)
+        new_next_normalized = new_next_bfs / max(1.0, new_total_bfs)
 
         # Rebuild state vector (matches state_to_vector layout)
-        # [0:3]   current_position
-        # [3:6]   remaining_distance
-        # [6:9]   previous_remaining_distance
-        # [9:12]  total_distance
-        # [12]    bfs_remaining
-        # [13]    bfs_total
-        # [14]    bfs_progress
-        # [15:19] mode onehot
-        # [19:23] candidate onehot
-        # [23:]   patch
+        # [0:3]   remaining_distance
+        # [3:6]   previous_remaining_distance
+        # [6]     normalized_bfs_remaining
+        # [7:11]  mode onehot
+        # [11:]   patch (last channel is goal-dependent BFS gradient)
+        new_s_patch = _replace_goal_gradient_channel(s[11:], cur_abs, new_goal)
+        new_ns_patch = _replace_goal_gradient_channel(ns[11:], next_abs, new_goal)
         new_s = np.concatenate([
-            np.asarray(cur_offset, dtype=np.float32),
             np.asarray(new_remaining, dtype=np.float32),
             np.asarray(new_prev_remaining, dtype=np.float32),
-            np.asarray(new_total, dtype=np.float32),
-            np.asarray([new_cur_bfs, new_total_bfs, new_progress], dtype=np.float32),
-            np.asarray(s[15:23], dtype=np.float32),
-            np.asarray(s[23:], dtype=np.float32),
+            np.asarray([new_cur_normalized], dtype=np.float32),
+            np.asarray(s[7:11], dtype=np.float32),
+            new_s_patch,
         ]).astype(np.float32)
 
         new_ns = np.concatenate([
-            np.asarray(next_offset, dtype=np.float32),
             np.asarray(new_next_remaining, dtype=np.float32),
             np.asarray(new_next_prev_remaining, dtype=np.float32),
-            np.asarray(new_total, dtype=np.float32),
-            np.asarray([new_next_bfs, new_total_bfs, new_next_progress], dtype=np.float32),
-            np.asarray(ns[15:23], dtype=np.float32),
-            np.asarray(ns[23:], dtype=np.float32),
+            np.asarray([new_next_normalized], dtype=np.float32),
+            np.asarray(ns[7:11], dtype=np.float32),
+            new_ns_patch,
         ]).astype(np.float32)
 
         # Recompute reward
@@ -292,18 +283,52 @@ class EpisodeBuffer:
 # ============================================================
 # HER helper functions
 # ============================================================
-def _offset_to_abs(offset, hex_start):
-    """Convert a cube-offset (from state vector) to absolute cube coords."""
+def _remaining_to_abs(remaining, hex_end):
+    """Convert a goal-minus-position vector to absolute cube coords."""
     return (
-        hex_start[0] + offset[0],
-        hex_start[1] + offset[1],
-        hex_start[2] + offset[2],
+        hex_end[0] - remaining[0],
+        hex_end[1] - remaining[1],
+        hex_end[2] - remaining[2],
     )
 
 
 def _hex_sub(c1, c2):
     """Cube subtraction (imported lazily to avoid circular imports)."""
     return (c1[0] - c2[0], c1[1] - c2[1], c1[2] - c2[2])
+
+
+def _replace_goal_gradient_channel(patch, pos, goal):
+    """Rebuild the final patch channel for a HER-relabeled goal.
+
+    HER does not store a new road BFS field, so this uses cube-distance descent
+    on cells marked as road by the first patch channel.
+    """
+    patch = np.asarray(patch, dtype=np.float32).copy()
+    if patch.size == 0 or patch.size % 6 != 0:
+        return patch
+
+    n_cells = patch.size // 6
+    road_patch = patch[:n_cells]
+    offsets = []
+    radius = 0
+    while len(offsets) < n_cells:
+        offsets.extend(_hex_ring_offsets(radius))
+        radius += 1
+
+    current_dist = float(hex_distance(pos, goal))
+    gradient = np.full(n_cells, -1.0, dtype=np.float32)
+    for idx, (dq, dr, ds) in enumerate(offsets[:n_cells]):
+        if road_patch[idx] == 0:
+            continue
+        cell = (pos[0] + dq, pos[1] + dr, pos[2] + ds)
+        gradient[idx] = float(np.clip(
+            current_dist - hex_distance(cell, goal),
+            -1.0,
+            1.0,
+        ))
+
+    patch[5 * n_cells:6 * n_cells] = gradient
+    return patch
 
 
 def _lookup_bfs(pos, goal, bfs_dist, hex_end):
@@ -359,8 +384,8 @@ class MLP(nn.Module):
 class StateEncoder(nn.Module):
     """将 flat state 拆分为 vector 特征 + hex patch，用 GNN 编码 patch。"""
 
-    def __init__(self, vec_dim: int = 23, hex_radius: int = 3,
-                 use_gnn: bool = True, in_channels: int = 5):
+    def __init__(self, vec_dim: int = 11, hex_radius: int = 3,
+                 use_gnn: bool = True, in_channels: int = 6):
         super().__init__()
         self.vec_dim = vec_dim
         self.hex_radius = hex_radius
@@ -399,7 +424,7 @@ class PolicyNet(nn.Module):
 
     def __init__(self, vec_dim: int, hex_radius: int, out_dim: int,
                  hidden_dim: int = 256, use_gnn: bool = True,
-                 in_channels: int = 5):
+                 in_channels: int = 6):
         super().__init__()
         self.encoder = StateEncoder(vec_dim, hex_radius, use_gnn, in_channels)
         self.head = nn.Sequential(
@@ -439,10 +464,10 @@ class SACConfig:
 # Discrete SAC Agent
 # ============================================================
 class DiscreteSACAgent:
-    def __init__(self, vec_dim: int = 23, hex_radius: int = 3,
+    def __init__(self, vec_dim: int = 11, hex_radius: int = 3,
                  action_dim: int = 6,
                  cfg: SACConfig = None, use_gnn: bool = True,
-                 in_channels: int = 5):
+                 in_channels: int = 6):
         if cfg is None:
             cfg = SACConfig()
         self.cfg = cfg

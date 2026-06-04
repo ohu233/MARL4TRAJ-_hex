@@ -100,34 +100,25 @@ def state_to_vector(state: Dict, mode_list: List[str] = None) -> np.ndarray:
     """
     将 PathEnv 的 dict state 编码成 1D 向量（hex 版本）:
 
-    [init_pos(3), target(3), cur(3), rel(3), bfs_remaining(1), bfs_total(1), bfs_progress(1),
-     mode_onehot(4), candidate_onehot(4), patch_flat]
-    总维度 = 23 + len(patch)
+    [remaining_distance(3), previous_remaining_distance(3),
+     normalized_bfs_remaining(1), mode_onehot(4), patch_flat]
+    总维度 = 11 + len(patch)
     """
     if mode_list is None:
         mode_list = MODE_LIST
 
-    init_pos = np.array(state['current_position'], dtype=np.float32)
-    target_pos = np.array(state['remaining_distance'], dtype=np.float32)
-    cur_pos = np.array(state['previous_remaining_distance'], dtype=np.float32)
-    rel_dis = np.array(state['total_distance'], dtype=np.float32)
-
-    # 确保是 3 维向量（cube 坐标），pad 或截断
-    for arr, name in [(init_pos, 'current_position'),
-                        (target_pos, 'remaining_distance'),
-                        (cur_pos, 'previous_remaining_distance'),
-                        (rel_dis, 'total_distance')]:
+    def _cube_vector(name):
+        arr = np.array(state[name], dtype=np.float32).reshape(-1)
         if arr.shape[0] < 3:
-            arr = np.pad(arr, (0, 3 - arr.shape[0]), constant_values=0)
-        elif arr.shape[0] > 3:
-            arr = arr[:3]
+            return np.pad(arr, (0, 3 - arr.shape[0]), constant_values=0)
+        return arr[:3]
 
-    # BFS 路网距离特征
-    bfs_remaining_val = float(state.get('bfs_remaining', 0.0))
-    bfs_total_val = float(state.get('bfs_total', 1.0))
-    bfs_remaining = np.array([bfs_remaining_val], dtype=np.float32)
-    bfs_total = np.array([bfs_total_val], dtype=np.float32)
-    bfs_progress = np.array([1.0 - bfs_remaining_val / max(1.0, bfs_total_val)], dtype=np.float32)
+    remaining = _cube_vector('remaining_distance')
+    previous_remaining = _cube_vector('previous_remaining_distance')
+    normalized_bfs_remaining = np.array(
+        [float(state.get('normalized_bfs_remaining', 0.0))],
+        dtype=np.float32,
+    )
 
     mode_onehot = np.zeros(len(mode_list), dtype=np.float32)
     current_mode = state['current_mode']
@@ -139,24 +130,22 @@ def state_to_vector(state: Dict, mode_list: List[str] = None) -> np.ndarray:
         if current_mode in mode_list:
             mode_onehot[mode_list.index(current_mode)] = 1.0
 
-    candidate_onehot = np.zeros(len(mode_list), dtype=np.float32)
-    candidate_modes = state.get('candidate_modes', set())
-    for m in candidate_modes:
-        if m in mode_list:
-            candidate_onehot[mode_list.index(m)] = 1.0
-
     patch = np.array(state['patch'], dtype=np.float32).reshape(-1)
 
-    vec = np.concatenate([init_pos, target_pos, cur_pos, rel_dis,
-                          bfs_remaining, bfs_total, bfs_progress,
-                          mode_onehot, candidate_onehot, patch], axis=0)
+    vec = np.concatenate([
+        remaining,
+        previous_remaining,
+        normalized_bfs_remaining,
+        mode_onehot,
+        patch,
+    ], axis=0)
     return vec
 
 
 def state_to_vector_hex(state: Dict, mode_list: List[str] = None) -> np.ndarray:
     """
     Hex 专用版（显式 hex 版本，与 state_to_vector 逻辑相同但语义更清晰）。
-    vec_dim = 23 (4 个 3D cube 向量 + 3 个 BFS 标量 + 2 个 4D onehot)
+    vec_dim = 11 (2 个 3D cube 向量 + 1 个 BFS 标量 + 1 个 4D onehot)
     """
     return state_to_vector(state, mode_list)
 
