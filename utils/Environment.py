@@ -44,6 +44,8 @@ class PathEnv:
                  bfs_max_nodes: int = 50000,                        # BFS 距离场最大节点数
                  reward_alpha: float = 0.3,                         # 势能场 cube 距离变化系数 α·ΔD_cube
                  reward_beta: float = 0.7,                          # 势能场路网距离变化系数 β·ΔD_net
+                 step_penalty: float = 0.1,                         # 每步代价，抑制绕路
+                 offroad_penalty: float = 8.0,                      # 离开选中路网的惩罚
                  adsorption_radius: int = 20,                       # 吸附集合 C_D 的搜索半径
                  adsorption_K: int = 3,                             # C_D 中保留的最近路网点数量
                  ):
@@ -63,6 +65,8 @@ class PathEnv:
         # 势能场奖励参数
         self.reward_alpha = reward_alpha
         self.reward_beta = reward_beta
+        self.step_penalty = float(step_penalty)
+        self.offroad_penalty = float(offroad_penalty)
         self.adsorption_radius = adsorption_radius
         self.adsorption_K = adsorption_K
 
@@ -216,7 +220,7 @@ class PathEnv:
         self.neighbor = get_hex_neighborhood(
             self.multi_mapdata, hex_start[0], hex_start[1], hex_start[2], radius=1
         )
-        initial_bfs_dist = self._adsorption_distance_to_C_D(hex_start)
+        initial_bfs_dist = self._effective_distance_to_goal(hex_start)
         self.initial_bfs_distance = max(1.0, float(initial_bfs_dist))
 
         self.traj_cnt += 1
@@ -301,10 +305,10 @@ class PathEnv:
     def calculate_reward(self, reward, prev_dist, curr_dist, neighbor, action,
                          prev_cube_dist=None, curr_cube_dist=None):
         """
-        势能场奖励：R_dist = α·ΔD_cube + β·ΔD_net
+        势能场奖励：R_dist = α·ΔD_cube + β·ΔD_eff
 
         ΔD_cube = D_cube(s_t, D) - D_cube(s_{t+1}, D)  (cube 距离变化)
-        ΔD_net = D_net(s_t, D) - D_net(s_{t+1}, D)    (路网距离变化)
+        ΔD_eff = D_eff(s_t, D) - D_eff(s_{t+1}, D)    (有效路网距离变化)
         α = reward_alpha, β = reward_beta
         """
         if prev_cube_dist is None:
@@ -325,7 +329,7 @@ class PathEnv:
         if is_on_road:
             reward += 1.0
         else:
-            reward -= 3.0
+            reward -= self.offroad_penalty
 
         return reward
 
@@ -387,15 +391,18 @@ class PathEnv:
         '''
         采取动作，计算奖励，更新状态
         '''
+        if action < 0 or action >= len(HEX_DIRECTIONS):
+            raise ValueError(f"Invalid PathEnv action {action}; expected 0-{len(HEX_DIRECTIONS) - 1}.")
+
         success = 0
-        reward = 0.0
+        reward = -self.step_penalty
         done = False
         self.step_cnt += 1
 
         # 移动前的状态
         pre_move_pos = self.hex_start
         pre_move_cube_dist = hex_distance(pre_move_pos, self.hex_end)
-        pre_move_bfs_dist = self._adsorption_distance_to_C_D(pre_move_pos)
+        pre_move_bfs_dist = self._effective_distance_to_goal(pre_move_pos)
 
         # 更新绝对坐标
         self.hex_start = hex_add(self.hex_start, HEX_DIRECTIONS[action])
@@ -412,7 +419,7 @@ class PathEnv:
         self.state['remaining_distance'] = (rem[0], rem[1], rem[2])
 
         # 移动后的状态
-        curr_bfs_dist = self._adsorption_distance_to_C_D(self.hex_start)
+        curr_bfs_dist = self._effective_distance_to_goal(self.hex_start)
         curr_cube_dist = hex_distance(self.hex_start, self.hex_end)
 
         self.state['normalized_bfs_remaining'] = (
@@ -434,7 +441,10 @@ class PathEnv:
         self.state['patch'] = self._build_patch(self.hex_start)
 
         # 判断 done
-        if self._is_on_selected_road(self.hex_start) and curr_bfs_dist <= self.distance_threshold:
+        if (
+            self._is_on_selected_road(self.hex_start)
+            and curr_cube_dist <= self.distance_threshold
+        ):
             reward += 50.0 * self.match_ratio
             done = True
             success = 1
