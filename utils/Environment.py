@@ -595,6 +595,29 @@ class CounterfactualPathEvaluator:
 
 class ModeEnv:
     """
+    Counterfactual Evidence–Bayesian Fusion–RL Decision Framework
+
+    逻辑是：
+
+    1. 因果/反事实产生证据
+    对每个候选模式做干预：
+
+    观察去掉该模式后路径恢复质量变化：
+
+
+    这就是“该模式是否必要”的证据。
+
+    2. 贝叶斯推理融合证据
+    维护模式信念：
+
+    每获得一个反事实证据，就更新一次：
+
+    3. RL 决定何时获取证据、剔除和停止
+    RL 的动作不是直接预测模式，而是决定：
+    检验哪个模式
+    剔除哪个模式；
+    是否停止并输出结果。
+
     剔除式 Mode 选择环境:
     1 episode = 1 OD, 3 步 step 逐步剔除 mode（4→3→2→1）。
     动作: 0=GSD, 1=GG, 2=TS, 3=TG（剔除哪个）。
@@ -608,14 +631,23 @@ class ModeEnv:
         train_mode: bool = True,
         fov: int = 3,
         distance_threshold: float = 1.0,
-        use_conv: bool = False,
     ):
+        """
+        输入:
+            model_path: 冻结 PathAgent 模型路径
+            mapdata: hex 路网数据 {(q,r,s): {'code': int, ...}}
+            traj: 轨迹 DataFrame，需含 ID/mode/distance_cells/time 等列
+            train_mode: 是否为训练模式（影响 episode 采样方式）
+            fov: PathEnv 观测半径
+            distance_threshold: PathEnv 成功判定距离阈值
+        输出: 无（初始化内部状态）
+        功能: 初始化 ModeEnv，加载 PathAgent 评估器，预计算归一化参数，构建 ID block 索引
+        """
         self.model_path = model_path
         self.traj = traj
         self.train_mode = train_mode
         self.fov = fov
         self.distance_threshold = distance_threshold
-        self.use_conv = use_conv
 
         self.hex_radius = HEX_RADIUS
         self.traj_cnt = 0
@@ -670,10 +702,14 @@ class ModeEnv:
             mode_maps=self.mapdata,
             fov=self.fov,
             distance_threshold=self.distance_threshold,
-            use_conv=self.use_conv,
         )
 
     def _build_id_blocks(self):
+        """
+        输入: 无（读取 self.traj, self.valid_modes）
+        输出: List[List[int]]，每个子列表是同一 ID 下的行索引集合（block）
+        功能: 按 ID 列对轨迹分组，过滤掉 mode 不合法的行，用于保证同一 ID 的轨迹段在训练中按序出现
+        """
         blocks_by_id = {}
         if "ID" not in self.traj.columns:
             for idx in range(len(self.traj)):
@@ -695,6 +731,11 @@ class ModeEnv:
         return [block for block in blocks_by_id.values() if block]
 
     def _reshuffle_episode_order(self):
+        """
+        输入: 无（读取 self._id_blocks）
+        输出: 无（修改 self._episode_order, self._episode_order_pos）
+        功能: 随机打乱 ID block 顺序，展开为平坦的行索引序列，一轮遍历完所有 block
+        """
         if not self._id_blocks:
             self._episode_order = []
             self._episode_order_pos = 0
@@ -708,6 +749,11 @@ class ModeEnv:
         self._episode_order_pos = 0
 
     def _next_episode_index(self):
+        """
+        输入: 无（读取 self._episode_order, self._episode_order_pos）
+        输出: int，当前 episode 应使用的行索引
+        功能: 按序返回下一个 episode 的行索引；若当前轮次用完则 reshuffle
+        """
         if not self._episode_order or self._episode_order_pos >= len(self._episode_order):
             self._reshuffle_episode_order()
         if not self._episode_order:
@@ -719,6 +765,11 @@ class ModeEnv:
         return idx
 
     def reset_episode_order(self):
+        """
+        输入: 无
+        输出: 无
+        功能: 重置 episode 采样状态（顺序指针、计数器、ID 历史），用于测试时从头开始
+        """
         self._episode_order = []
         self._episode_order_pos = 0
         self.traj_cnt = 0
@@ -742,185 +793,35 @@ class ModeEnv:
             self._vel_max = 1.0
 
     def _norm_distance(self, val):
+        """
+        输入: val (float) — 原始栅格距离
+        输出: float, [0, 1] 归一化距离
+        功能: 除以全局最大距离，clip 到 1
+        """
         return min(float(val) / self._dist_max, 1.0)
 
     def _norm_time(self, val):
+        """
+        输入: val (float) — 原始时间
+        输出: float, [0, 1] 归一化时间
+        功能: 除以全局最大时间，clip 到 1
+        """
         return min(float(val) / self._time_max, 1.0)
 
     def _norm_velocity(self, val):
+        """
+        输入: val (float) — 原始速度
+        输出: float, [0, 1] 归一化速度
+        功能: 除以全局最大速度，clip 到 1
+        """
         return min(float(val) / self._vel_max, 1.0)
 
-    def _run_PathMode(self, selected_modes):
-        traj_one = self.current_row.reset_index(drop=True)
-        if self.hex_mapdata_raw is None:
-            raise ValueError("ModeEnv requires raw hex mapdata to create PathEnv.")
-
-        env = PathEnv(
-            train_mode=False,
-            selected_mode=np.array(selected_modes),
-            mapdata=self.hex_mapdata_raw,
-            traj=traj_one,
-            FOV=self.fov,
-            distance_threshold=self.distance_threshold,
-        )
-
-        s = env.reset()
-        traj_points = [(env.hex_start[0], env.hex_start[1], env.hex_start[2])]
-        steps = 0
-        success = 0
-        done = False
-
-        while not done:
-            s_vec = state_to_vector(s)
-            a = self.path_agent.select_action(s_vec, evaluate=True)
-            s, _, done, succ = env.step(int(a))
-            traj_points.append((
-                env.hex_start[0], env.hex_start[1], env.hex_start[2],
-            ))
-            steps += 1
-            success = int(succ)
-
-        path_len = float(steps)
-        multi_match_rate = float(env.match_ratio)
-
-        selected_set = set(selected_modes)
-        mode_scores = {m: 0.0 for m in modelist}
-        total_points = float(max(len(traj_points), 1))
-
-        if len(traj_points) > 0 and len(selected_modes) > 0:
-            _mode_maps = {m: self.mapdata[m] for m in selected_modes}
-            for p in traj_points:
-                if p is None or len(p) < 3:
-                    continue
-                q, r, s = int(round(p[0])), int(round(p[1])), int(round(p[2]))
-                for m in selected_modes:
-                    if _mode_maps[m].get((q, r, s), 0) != 0:
-                        mode_scores[m] += 1.0
-
-        match_rate = []
-        for m in modelist:
-            if m in selected_set:
-                match_rate.append(float(mode_scores[m] / total_points))
-            else:
-                match_rate.append(0.0)
-
-        return match_rate, multi_match_rate, success, steps, path_len
-
-    def _elimination_reward(self, old_eval, new_eval):
-        reward = 0.0
-
-        # 1. 主导 mode 贡献度变化
-        reward += (max(new_eval["match_rates"]) - max(old_eval["match_rates"])) * 5.0
-
-        # 2. Gap 变化（第1名 vs 第2名 match_rate 差距）
-        old_active = sorted([r for r in old_eval["match_rates"] if r > 0], reverse=True)
-        new_active = sorted([r for r in new_eval["match_rates"] if r > 0], reverse=True)
-        old_gap = (old_active[0] - old_active[1]) if len(old_active) >= 2 else (old_active[0] if old_active else 0.0)
-        new_gap = (new_active[0] - new_active[1]) if len(new_active) >= 2 else (new_active[0] if new_active else 0.0)
-        reward += (new_gap - old_gap) * 3.0
-
-        # 3. 成功状态
-        if old_eval["success"] == 1 and new_eval["success"] == 0:
-            reward -= 3.0
-        elif old_eval["success"] == 0 and new_eval["success"] == 1:
-            reward += 2.0
-
-        # 4. 剔除奖励
-        reward += 0.1
-        return reward
-
-    def _final_bonus(self, final_eval):
-        bonus = 0.0
-        if final_eval["success"] == 1:
-            bonus += 2.0
-        bonus += max(final_eval["match_rates"]) * 3.0
-        return bonus
-
-    def reset(self):
-        idx = self.traj_cnt % len(self.traj)
-        self.current_row = self.traj.iloc[[idx]].copy()
-        self.traj_cnt += 1
-        self.step_cnt = 0
-        self.active_modes = list(modelist)
-
-        # ID 序贯: 检测 ID 变化
-        cur_id = str(self.current_row['ID'].iat[0]).strip()
-        if cur_id != self._last_id:
-            self.current_id_history = []
-            self._last_id = cur_id
-
-        # baseline 评估: 全部 4 modes
-        match_rates, multi_match, success, steps, path_len = self._run_PathMode(self.active_modes)
-        self.last_eval = {
-            "match_rates": match_rates,
-            "multi_match_rate": multi_match,
-            "success": success,
-            "steps": steps,
-            "path_len": path_len,
-        }
-
-        self.state = {
-            "active_mode_mask": [1, 1, 1, 1],
-            "match_rates": match_rates,
-            "multi_match_rate": multi_match,
-            "success": success,
-            "steps": steps,
-            "distance_cells": self._norm_distance(self.current_row['distance_cells'].iat[0]),
-            "time": self._norm_time(self.current_row['time'].iat[0]),
-            "velocity": self._norm_velocity(self.current_row['velocity'].iat[0]),
-            "remaining_count": 4,
-            "prev_modes": self.current_id_history.copy(),
-        }
-        return self.state
-
-    def step(self, action):
-        self.step_cnt += 1
-        mode_to_eliminate = modelist[action]
-        self.active_modes.remove(mode_to_eliminate)
-
-        # 用剩余 modes 跑 PathAgent
-        match_rates, multi_match, success, steps, path_len = self._run_PathMode(self.active_modes)
-        new_eval = {
-            "match_rates": match_rates,
-            "multi_match_rate": multi_match,
-            "success": success,
-            "steps": steps,
-            "path_len": path_len,
-        }
-
-        reward = self._elimination_reward(self.last_eval, new_eval)
-        self.last_eval = new_eval
-
-        done = (self.step_cnt >= 3)
-        if done:
-            reward += self._final_bonus(new_eval)
-            survived = self.active_modes[0]
-            self.current_id_history.append(survived)
-            if len(self.current_id_history) > self.history_len:
-                self.current_id_history = self.current_id_history[-self.history_len:]
-
-        active_mask = [1 if m in self.active_modes else 0 for m in modelist]
-        self.state = {
-            "active_mode_mask": active_mask,
-            "match_rates": match_rates,
-            "multi_match_rate": multi_match,
-            "success": success,
-            "steps": steps,
-            "distance_cells": self._norm_distance(self.current_row['distance_cells'].iat[0]),
-            "time": self._norm_time(self.current_row['time'].iat[0]),
-            "velocity": self._norm_velocity(self.current_row['velocity'].iat[0]),
-            "remaining_count": len(self.active_modes),
-            "prev_modes": self.current_id_history,
-        }
-
-        return self.state, float(reward), done, int(success)
-
-    def _true_mode(self):
-        if self.current_row is None or "mode" not in self.current_row.columns:
-            return None
-        return str(self.current_row["mode"].iat[0]).strip()
-
     def _initial_belief(self):
+        """
+        输入: 无（读取 self.current_id_history）
+        输出: np.ndarray (4,) — 初始信念概率分布
+        功能: 基于当前 ID 历史中已选出的 mode 构造先验信念，历史中出现的 mode 权重 +0.5
+        """
         prior = np.ones(len(modelist), dtype=np.float32)
         for mode in self.current_id_history:
             if mode in modelist:
@@ -928,6 +829,11 @@ class ModeEnv:
         return prior / max(float(prior.sum()), 1e-8)
 
     def _update_belief(self):
+        """
+        输入: 无（读取 self.delta_q, self.belief, self.active_modes, self.belief_alpha, self.belief_beta）
+        输出: 无（修改 self.belief）
+        功能: 用反事实证据 delta_q 更新贝叶斯信念。logits = alpha * delta_q + beta * log(belief)，只保留 active mode
+        """
         active_mask = np.array([1.0 if m in self.active_modes else 0.0 for m in modelist], dtype=np.float32)
         if active_mask.sum() <= 0:
             self.belief = np.ones(len(modelist), dtype=np.float32) / len(modelist)
@@ -945,8 +851,17 @@ class ModeEnv:
         else:
             probs = probs / denom
         self.belief = probs.astype(np.float32)
+        belief_str = "  ".join(f"{m}:{self.belief[i]:.3f}" for i, m in enumerate(modelist))
+        delta_str = "  ".join(f"{m}:{delta[i]:.3f}" for i, m in enumerate(modelist))
+        print(f"  [belief更新] delta_q=[{delta_str}]")
+        print(f"  [belief更新] belief=[{belief_str}]")
 
     def _predict_mode(self):
+        """
+        输入: 无（读取 self.belief, self.active_modes）
+        输出: str — 当前信念最高的 mode 名称
+        功能: 在 active_modes 中取 belief 最大的 mode 作为预测结果
+        """
         active_indices = [i for i, m in enumerate(modelist) if m in self.active_modes]
         if not active_indices:
             return modelist[int(np.argmax(self.belief))]
@@ -954,6 +869,12 @@ class ModeEnv:
         return modelist[best_idx]
 
     def _refresh_counterfactual_state(self, update_belief=True):
+        """
+        输入:
+            update_belief: bool — 是否同步更新 belief
+        输出: 无（修改 self.last_eval, self.q_base, self.q_without, self.delta_q, self.belief, self.pred_mode）
+        功能: 对当前 active_modes 执行反事实评估，计算每个 mode 的 leave-one-out delta_q，可选更新 belief
+        """
         base_eval, q_without, delta_q = self.evaluator.counterfactual_eval(
             self.current_row,
             self.active_modes,
@@ -962,14 +883,35 @@ class ModeEnv:
         self.q_base = float(base_eval["q"])
         self.q_without = [float(v) for v in q_without]
         self.delta_q = [float(v) for v in delta_q]
+        print(f"  [反事实评估] active={self.active_modes}  q_base={self.q_base:.3f}  "
+              f"success={base_eval['success']}  multi_match={base_eval['multi_match_rate']:.3f}  "
+              f"steps={base_eval['steps']}")
+        mr_str = "  ".join(f"{m}:{base_eval['match_rates'][i]:.3f}" for i, m in enumerate(modelist))
+        print(f"  [反事实评估] match_rates=[{mr_str}]")
+        qw_str = "  ".join(f"{m}:{self.q_without[i]:.3f}" for i, m in enumerate(modelist))
+        dq_str = "  ".join(f"{m}:{self.delta_q[i]:.3f}" for i, m in enumerate(modelist))
+        print(f"  [反事实评估] q_without=[{qw_str}]")
+        print(f"  [反事实评估] delta_q  =[{dq_str}]")
         if update_belief:
             self._update_belief()
         self.pred_mode = self._predict_mode()
+        belief_str = "  ".join(f"{m}:{self.belief[i]:.3f}" for i, m in enumerate(modelist))
+        print(f"  [预测结果] pred_mode={self.pred_mode}  belief=[{belief_str}]")
 
     def _stop_allowed(self):
+        """
+        输入: 无
+        输出: int — 1 允许 stop，0 不允许
+        功能: 判断当前步骤是否允许执行 stop 动作（当前恒返回 1）
+        """
         return 1
 
     def _build_state(self):
+        """
+        输入: 无（读取 self.active_modes, self.belief, self.delta_q, self.q_base, self.q_without, self.last_eval, self.current_row, self.current_id_history, self.pred_mode）
+        输出: dict — DQN 可消费的 state 字典，包含 active_mode_mask/belief/delta_q/q_base/q_without/stop_allowed/match_rates 等 18 个字段
+        功能: 将内部状态打包为标准 state 字典，供 mode_state_to_vector 展平为向量
+        """
         active_mask = [1 if m in self.active_modes else 0 for m in modelist]
         return {
             "active_mode_mask": active_mask,
@@ -993,13 +935,28 @@ class ModeEnv:
         }
 
     def _finish_episode(self):
+        """
+        输入: 无（读取 self.belief, self.active_modes, self.current_id_history, self.history_len）
+        输出: 无（修改 self.pred_mode, self.current_id_history）
+        功能: episode 结束时确定最终预测 mode，追加到 ID 历史（最多保留 history_len 条）
+        """
         self.pred_mode = self._predict_mode()
+        true_mode = str(self.current_row['mode'].iat[0]).strip() if 'mode' in self.current_row.columns else "?"
+        correct = int(self.pred_mode == true_mode) if true_mode in modelist else -1
+        mark = "OK" if correct == 1 else ("MISS" if correct == 0 else "NO_LABEL")
+        print(f"  [Episode结束] pred={self.pred_mode}  true={true_mode}  {mark}  "
+              f"history={self.current_id_history}")
         if self.pred_mode in modelist:
             self.current_id_history.append(self.pred_mode)
             if len(self.current_id_history) > self.history_len:
                 self.current_id_history = self.current_id_history[-self.history_len:]
 
     def invalid_action_mask(self):
+        """
+        输入: 无（读取 self.active_modes）
+        输出: np.ndarray (5,) bool — True 表示该动作不可选
+        功能: 标记无效动作：已不在 active 中的 mode 不可剔除；仅剩 1 个 mode 时不可再剔除
+        """
         mask = np.zeros(len(modelist) + 1, dtype=bool)
         for idx, mode in enumerate(modelist):
             if mode not in self.active_modes or len(self.active_modes) <= 1:
@@ -1009,6 +966,11 @@ class ModeEnv:
         return mask
 
     def _run_PathMode(self, selected_modes):
+        """
+        输入: selected_modes (list[str]) — 要评估的 mode 组合
+        输出: tuple(match_rates, multi_match_rate, success, steps, path_len)
+        功能: 委托 evaluator.evaluate 对当前轨迹在指定 mode 组合下做 PathAgent rollout
+        """
         result = self.evaluator.evaluate(self.current_row, selected_modes)
         return (
             result["match_rates"],
@@ -1019,6 +981,11 @@ class ModeEnv:
         )
 
     def _stop_reward(self):
+        """
+        输入: 无（读取 self.belief, self.q_base, self.active_modes）
+        输出: float, clipped to [-3.0, 3.0]
+        功能: 计算 stop 动作的奖励 = q_base + 0.5*confidence - 0.2*entropy - sparsity_penalty
+        """
         belief = np.maximum(self.belief.astype(np.float32), 1e-8)
         entropy = -float(np.sum(belief * np.log(belief)))
         confidence = float(np.max(belief))
@@ -1027,6 +994,11 @@ class ModeEnv:
         return float(np.clip(reward, -3.0, 3.0))
 
     def reset(self):
+        """
+        输入: 无（读取 self.traj, self.train_mode）
+        输出: dict — 初始 state 字典（4 mode 全 active，已完成首轮反事实评估）
+        功能: 采样一条轨迹，重置 active_modes 为全部 4 个 mode，初始化 belief，执行反事实评估得到 delta_q，构建初始 state
+        """
         if self.train_mode:
             idx = self._next_episode_index()
         else:
@@ -1046,16 +1018,28 @@ class ModeEnv:
             self._last_id = cur_id
 
         self.belief = self._initial_belief()
+        print(f"\n{'='*80}")
+        print(f"[Episode] ID={cur_id}  prev_history={self.current_id_history}  "
+              f"dist={self.current_row['distance_cells'].iat[0]:.1f}  "
+              f"velocity={self.current_row.get('velocity', pd.Series([0])).iat[0]:.2f}")
         self._refresh_counterfactual_state(update_belief=True)
         self.state = self._build_state()
         return self.state
 
     def step(self, action):
+        """
+        输入:
+            action: int — 0-3 剔除对应 mode，4(stop_action) 提前停止
+        输出: tuple(state: dict, reward: float, done: bool, success: int)
+        功能: 执行动作。stop → 计算 stop_reward 并结束；剔除 → 移除 mode、重新反事实评估、计算 reward = -delta_q + 0.1；达 max_mode_steps 时自动结束
+        """
         self.step_cnt += 1
 
         if action == self.stop_action:
             reward = self._stop_reward()
             reward -= 0.05
+            belief_str = "  ".join(f"{m}:{self.belief[i]:.3f}" for i, m in enumerate(modelist))
+            print(f"  [Step {self.step_cnt}] >>> STOP  reward={reward:.3f}  pred={self.pred_mode}  belief=[{belief_str}]")
             self._finish_episode()
             self.state = self._build_state()
             return self.state, float(reward), True, int(self.state["success"])
@@ -1067,6 +1051,7 @@ class ModeEnv:
             or len(self.active_modes) <= 1
         )
         if invalid:
+            print(f"  [Step {self.step_cnt}] >>> INVALID action={action}  active={self.active_modes}")
             reward = -2.0 - 0.05
             done = self.step_cnt >= self.max_mode_steps
             if done:
@@ -1077,6 +1062,8 @@ class ModeEnv:
         removed_mode = modelist[action]
         delta_removed = float(self.delta_q[action])
         self.active_modes.remove(removed_mode)
+        print(f"  [Step {self.step_cnt}] >>> REMOVE {removed_mode}  delta_q={delta_removed:.3f}  "
+              f"remaining={self.active_modes}")
         self._refresh_counterfactual_state(update_belief=True)
 
         reward = -delta_removed + 0.1
@@ -1085,6 +1072,7 @@ class ModeEnv:
 
         done = self.step_cnt >= self.max_mode_steps
         if done:
+            print(f"  [Step {self.step_cnt}] --- 达到 max_mode_steps，自动结束 ---")
             reward += self._stop_reward()
             reward = float(np.clip(reward, -3.0, 3.0))
             self._finish_episode()

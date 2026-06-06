@@ -82,39 +82,6 @@ MODELIST = ['GSD', 'GG', 'TS', 'TG']
 
 def mode_state_to_vector(state: Dict[str, Any]) -> np.ndarray:
     """
-    ModeEnv state 展平 (剔除式 MDP, 23 维):
-    active_mode_mask(4), match_rates(4), multi_match_rate(1), success(1), steps(1),
-    distance_cells(1), time(1), velocity(1), remaining_count(1),
-    prev_mode_1_onehot(4), prev_mode_2_onehot(4)
-    """
-    prev = state.get("prev_modes", [])
-
-    active_mask = np.array(state.get("active_mode_mask", [1, 1, 1, 1]), dtype=np.float32)
-    match_rates = np.array(state.get("match_rates", [0, 0, 0, 0]), dtype=np.float32)
-    multi_match = np.array([float(state.get("multi_match_rate", 0.0))], dtype=np.float32)
-    success = np.array([float(state.get("success", 0))], dtype=np.float32)
-    steps = np.array([float(state.get("steps", 0))], dtype=np.float32)
-    dist = np.array([float(state.get("distance_cells", 0.0))], dtype=np.float32)
-    time_f = np.array([float(state.get("time", 0.0))], dtype=np.float32)
-    vel = np.array([float(state.get("velocity", 0.0))], dtype=np.float32)
-    remaining = np.array([float(state.get("remaining_count", 4))], dtype=np.float32)
-
-    prev_1 = np.zeros(4, dtype=np.float32)
-    prev_2 = np.zeros(4, dtype=np.float32)
-    if len(prev) >= 1 and prev[-1] in MODELIST:
-        prev_1[MODELIST.index(prev[-1])] = 1.0
-    if len(prev) >= 2 and prev[-2] in MODELIST:
-        prev_2[MODELIST.index(prev[-2])] = 1.0
-
-    return np.concatenate([
-        active_mask, match_rates, multi_match, success, steps,
-        dist, time_f, vel, remaining,
-        prev_1, prev_2
-    ]).astype(np.float32)
-
-
-def mode_state_to_vector(state: Dict[str, Any]) -> np.ndarray:
-    """
     Counterfactual ModeEnv state vector.
 
     Layout:

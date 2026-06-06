@@ -322,7 +322,6 @@ if __name__ == "__main__":
         train_mode=True,
         fov=5,
         distance_threshold=1.0,
-        use_conv=False,
     )
 
     dqn_cfg = DQNConfig(

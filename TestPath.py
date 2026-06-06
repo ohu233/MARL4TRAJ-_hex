@@ -18,7 +18,7 @@ SAVE_DIR = "TestPath_results"
 FOV = 5
 USE_GNN = False
 MAX_STEPS = 300
-SAVE_FIGURES = 15  # True=全部保存, False/0=不保存, N=每种mode保存N个ID的图像
+SAVE_FIGURES = True  # True=全部保存, False/0=不保存, N=每种mode保存N个ID的图像
 
 # 测试时的 mode 选择方式:
 # 'all'   - 使用全部 4 种 mode（全模式复合路网）
