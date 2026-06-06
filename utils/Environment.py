@@ -1,4 +1,3 @@
-import copy
 import pickle
 import numpy as np
 import pandas as pd
@@ -203,7 +202,7 @@ class PathEnv:
             self._bfs_dist = None
 
         # 计算 max_step：优先用路网约束下的有效距离
-        if road_start is not None and self._bfs_dist is not None and road_start in self._bfs_dist:
+        if road_start is not None and self._road_end is not None and self._bfs_dist is not None and road_start in self._bfs_dist:
             # 有效距离=起点到最近路网距离+多源距离场距离+终点到最近路网距离
             eff_dist = (
                 hex_distance(hex_start, road_start)
@@ -456,11 +455,150 @@ class PathEnv:
 
 
 
+class CounterfactualPathEvaluator:
+    """Run frozen PathAgent rollouts and score counterfactual mode sets."""
+
+    def __init__(
+        self,
+        model_path: str,
+        hex_mapdata_raw: dict,
+        mode_maps: dict,
+        fov: int = 3,
+        distance_threshold: float = 1.0,
+        use_conv: bool = False,
+    ):
+        if hex_mapdata_raw is None:
+            raise ValueError("CounterfactualPathEvaluator requires raw hex mapdata.")
+
+        self.hex_mapdata_raw = hex_mapdata_raw
+        self.mode_maps = mode_maps
+        self.fov = fov
+        self.distance_threshold = distance_threshold
+
+        cfg = SACConfig()
+        device = torch.device(cfg.device)
+        path_agent = DiscreteSACAgent(
+            vec_dim=11,
+            hex_radius=self.fov,
+            action_dim=6,
+            cfg=cfg,
+            use_gnn=use_conv,
+            in_channels=6,
+        )
+        state_dict = torch.load(model_path, map_location=device)
+        path_agent.actor.load_state_dict(state_dict)
+        path_agent.actor.eval()
+        self.path_agent = path_agent
+
+    def _compute_quality(self, result):
+        return float(
+            2.0 * float(result["success"])
+            + 3.0 * float(result["multi_match_rate"])
+            + 1.0 * float(result["progress_score"])
+            - 0.5 * float(result["normalized_steps"])
+        )
+
+    def evaluate(self, traj_one: pd.DataFrame, selected_modes):
+        selected_modes = list(selected_modes)
+        if len(selected_modes) == 0:
+            return {
+                "match_rates": [0.0 for _ in modelist],
+                "multi_match_rate": 0.0,
+                "success": 0,
+                "steps": 0,
+                "path_len": 0.0,
+                "progress_score": 0.0,
+                "normalized_steps": 1.0,
+                "final_distance": float("inf"),
+                "q": -0.5,
+            }
+
+        env = PathEnv(
+            train_mode=False,
+            selected_mode=np.array(selected_modes),
+            mapdata=self.hex_mapdata_raw,
+            traj=traj_one.reset_index(drop=True),
+            FOV=self.fov,
+            distance_threshold=self.distance_threshold,
+        )
+
+        state = env.reset()
+        start_pos = tuple(env.hex_start)
+        goal_pos = tuple(env.hex_end)
+        initial_distance = max(float(hex_distance(start_pos, goal_pos)), 1.0)
+        traj_points = [start_pos]
+        steps = 0
+        success = 0
+        done = False
+
+        while not done:
+            state_vec = state_to_vector(state)
+            action = self.path_agent.select_action(state_vec, evaluate=True)
+            state, _, done, succ = env.step(int(action))
+            traj_points.append(tuple(env.hex_start))
+            steps += 1
+            success = int(succ)
+
+        final_distance = float(hex_distance(tuple(env.hex_start), goal_pos))
+        progress_score = max(0.0, min(1.0, (initial_distance - final_distance) / initial_distance))
+        normalized_steps = float(steps) / float(max(getattr(env, "max_step", steps), 1))
+        normalized_steps = max(0.0, min(1.0, normalized_steps))
+
+        selected_set = set(selected_modes)
+        mode_scores = {m: 0.0 for m in modelist}
+        total_points = float(max(len(traj_points), 1))
+        selected_maps = {m: self.mode_maps[m] for m in selected_modes}
+        for point in traj_points:
+            q, r, s = int(round(point[0])), int(round(point[1])), int(round(point[2]))
+            for mode in selected_modes:
+                if selected_maps[mode].get((q, r, s), 0) != 0:
+                    mode_scores[mode] += 1.0
+
+        result = {
+            "match_rates": [
+                float(mode_scores[m] / total_points) if m in selected_set else 0.0
+                for m in modelist
+            ],
+            "multi_match_rate": float(env.match_ratio),
+            "success": success,
+            "steps": steps,
+            "path_len": float(steps),
+            "progress_score": progress_score,
+            "normalized_steps": normalized_steps,
+            "final_distance": final_distance,
+        }
+        result["q"] = self._compute_quality(result)
+        return result
+
+    def counterfactual_eval(self, traj_one: pd.DataFrame, active_modes):
+        active_modes = list(active_modes)
+        base_eval = self.evaluate(traj_one, active_modes)
+        q_base = float(base_eval["q"])
+        q_without = [0.0 for _ in modelist]
+        delta_q = [0.0 for _ in modelist]
+        active_set = set(active_modes)
+
+        for idx, mode in enumerate(modelist):
+            if mode not in active_set:
+                continue
+            without_modes = [m for m in active_modes if m != mode]
+            if len(without_modes) == 0:
+                q_without[idx] = 0.0
+                delta_q[idx] = q_base
+                continue
+            without_eval = self.evaluate(traj_one, without_modes)
+            q_without[idx] = float(without_eval["q"])
+            delta_q[idx] = float(q_base - q_without[idx])
+
+        return base_eval, q_without, delta_q
+
+
 class ModeEnv:
-    # TODO:重写:输入为同一ID的一批数据
     """
-    Train: 选择 mode 组合（4bit），调用已训练 PathAgent 回放路径，输出匹配指标与奖励
-    Test:  同样流程，但关闭扰动，使用评估动作
+    剔除式 Mode 选择环境:
+    1 episode = 1 OD, 3 步 step 逐步剔除 mode（4→3→2→1）。
+    动作: 0=GSD, 1=GG, 2=TS, 3=TG（剔除哪个）。
+    state 包含同 ID 前面段选出的 mode（序贯决策）。
     """
     def __init__(
         self,
@@ -479,12 +617,33 @@ class ModeEnv:
         self.distance_threshold = distance_threshold
         self.use_conv = use_conv
 
-        self.no_change_patience = 5
-        self.no_change_streak = 0
-
         self.hex_radius = HEX_RADIUS
         self.traj_cnt = 0
         self.current_row = None
+        self.step_cnt = 0
+        self.active_modes = list(modelist)
+        self.last_eval = None
+        self.max_mode_steps = 4
+        self.stop_action = len(modelist)
+        self.belief_alpha = 2.0
+        self.belief_beta = 0.5
+        self.belief = np.ones(len(modelist), dtype=np.float32) / len(modelist)
+        self.q_base = 0.0
+        self.q_without = [0.0 for _ in modelist]
+        self.delta_q = [0.0 for _ in modelist]
+        self.pred_mode = None
+
+        # ID 序贯历史
+        self._last_id = None
+        self.current_id_history = []
+        self.history_len = 3
+        self.valid_modes = set(modelist)
+        self._id_blocks = self._build_id_blocks()
+        self._episode_order = []
+        self._episode_order_pos = 0
+
+        # 归一化统计量（预计算）
+        self._precompute_norm_stats()
 
         # 加载并处理 hex mapdata
         first_key = next(iter(mapdata)) if mapdata else None
@@ -504,68 +663,92 @@ class ModeEnv:
             raise ValueError("ModeEnv requires hex mapdata. Use load_hex_mapdata_raw().")
 
         self.mode_maps = self.mapdata
-        self.mode_speed_stats = self._build_mode_speed_stats()
 
-        cfg = SACConfig()
-        device = torch.device(cfg.device)
+        self.evaluator = CounterfactualPathEvaluator(
+            model_path=self.model_path,
+            hex_mapdata_raw=self.hex_mapdata_raw,
+            mode_maps=self.mapdata,
+            fov=self.fov,
+            distance_threshold=self.distance_threshold,
+            use_conv=self.use_conv,
+        )
 
-        path_agent = DiscreteSACAgent(vec_dim=11, hex_radius=self.fov, action_dim=6,
-                                       cfg=cfg, use_gnn=True, in_channels=6)
-        state_dict = torch.load(self.model_path, map_location=device)
-        path_agent.actor.load_state_dict(state_dict)
-        path_agent.actor.eval()
-        self.path_agent = path_agent
-
-    def _mask_to_modes(self, mask):
-        return [modelist[i] for i, v in enumerate(mask) if int(v) == 1]
-
-    def _default_mode_mask(self):
-        return [1, 1, 1, 1]
-
-    def _infer_init_mode_mask(self, idx: int):
-        """
-        初始化 mode 状态（hex 版本）。
-        """
-        if len(self.traj) <= 1 or idx <= 0:
-            return self._default_mode_mask()
-
+    def _build_id_blocks(self):
+        blocks_by_id = {}
         if "ID" not in self.traj.columns:
-            return self._default_mode_mask()
+            for idx in range(len(self.traj)):
+                row = self.traj.iloc[idx]
+                if "mode" not in self.traj.columns or str(row.get("mode", "")).strip() in self.valid_modes:
+                    blocks_by_id[f"row_{idx}"] = [idx]
+            return list(blocks_by_id.values())
 
-        cur_row = self.traj.iloc[idx]
-        prev_row = self.traj.iloc[idx - 1]
+        for idx in range(len(self.traj)):
+            row = self.traj.iloc[idx]
+            if "mode" in self.traj.columns and str(row.get("mode", "")).strip() not in self.valid_modes:
+                continue
+            traj_id = str(row.get("ID", "")).strip()
+            if traj_id == "":
+                traj_id = f"row_{idx}"
+            if traj_id not in blocks_by_id:
+                blocks_by_id[traj_id] = []
+            blocks_by_id[traj_id].append(idx)
+        return [block for block in blocks_by_id.values() if block]
 
-        cur_id = str(cur_row.get("ID", "")).strip()
-        prev_id = str(prev_row.get("ID", "")).strip()
-        if cur_id == "" or prev_id == "" or cur_id != prev_id:
-            return self._default_mode_mask()
+    def _reshuffle_episode_order(self):
+        if not self._id_blocks:
+            self._episode_order = []
+            self._episode_order_pos = 0
+            return
 
-        # 读取前一个终点的 cube 坐标
-        try:
-            if all(c in prev_row.index for c in ['locxd', 'locyd', 'loczd']):
-                q = int(round(float(prev_row["locxd"])))
-                r = int(round(float(prev_row["locyd"])))
-                s = int(round(float(prev_row["loczd"])))
-        except Exception:
-            return self._default_mode_mask()
+        block_indices = np.arange(len(self._id_blocks))
+        np.random.shuffle(block_indices)
+        self._episode_order = []
+        for block_idx in block_indices:
+            self._episode_order.extend(self._id_blocks[int(block_idx)])
+        self._episode_order_pos = 0
 
-        key = (q, r, s)
-        mask = []
-        for m in modelist:
-            mask.append(1 if self.mode_maps[m].get(key, 0) != 0 else 0)
+    def _next_episode_index(self):
+        if not self._episode_order or self._episode_order_pos >= len(self._episode_order):
+            self._reshuffle_episode_order()
+        if not self._episode_order:
+            raise ValueError("ModeEnv has no valid training episodes after mode filtering.")
 
-        if int(np.sum(mask)) == 0:
-            return self._default_mode_mask()
+        idx = self._episode_order[self._episode_order_pos]
+        self._episode_order_pos += 1
+        self.traj_cnt += 1
+        return idx
 
-        return mask
+    def reset_episode_order(self):
+        self._episode_order = []
+        self._episode_order_pos = 0
+        self.traj_cnt = 0
+        self._last_id = None
+        self.current_id_history = []
 
-    def _build_mode_speed_stats(self):
-        """构建各 mode 的速度统计（占位）。"""
-        return {m: {'mean': 60.0, 'std': 20.0} for m in modelist}
+    def _precompute_norm_stats(self):
+        """预计算轨迹特征的归一化参数（max / mean+std）。"""
+        if 'distance_cells' in self.traj.columns:
+            self._dist_max = max(float(self.traj['distance_cells'].max()), 1.0)
+        else:
+            self._dist_max = 1.0
+        if 'time' in self.traj.columns:
+            self._time_max = max(float(self.traj['time'].max()), 1.0)
+        else:
+            self._time_max = 1.0
+        if 'velocity' in self.traj.columns:
+            v_col = self.traj['velocity']
+            self._vel_max = max(float(v_col.max()), 1e-6)
+        else:
+            self._vel_max = 1.0
 
-    def _speed_deviation_reward(self, cur_mask, velocity):
-        """速度偏差奖励（占位）。"""
-        return 0.0
+    def _norm_distance(self, val):
+        return min(float(val) / self._dist_max, 1.0)
+
+    def _norm_time(self, val):
+        return min(float(val) / self._time_max, 1.0)
+
+    def _norm_velocity(self, val):
+        return min(float(val) / self._vel_max, 1.0)
 
     def _run_PathMode(self, selected_modes):
         traj_one = self.current_row.reset_index(drop=True)
@@ -598,7 +781,6 @@ class ModeEnv:
             success = int(succ)
 
         path_len = float(steps)
-
         multi_match_rate = float(env.match_ratio)
 
         selected_set = set(selected_modes)
@@ -624,110 +806,291 @@ class ModeEnv:
 
         return match_rate, multi_match_rate, success, steps, path_len
 
+    def _elimination_reward(self, old_eval, new_eval):
+        reward = 0.0
+
+        # 1. 主导 mode 贡献度变化
+        reward += (max(new_eval["match_rates"]) - max(old_eval["match_rates"])) * 5.0
+
+        # 2. Gap 变化（第1名 vs 第2名 match_rate 差距）
+        old_active = sorted([r for r in old_eval["match_rates"] if r > 0], reverse=True)
+        new_active = sorted([r for r in new_eval["match_rates"] if r > 0], reverse=True)
+        old_gap = (old_active[0] - old_active[1]) if len(old_active) >= 2 else (old_active[0] if old_active else 0.0)
+        new_gap = (new_active[0] - new_active[1]) if len(new_active) >= 2 else (new_active[0] if new_active else 0.0)
+        reward += (new_gap - old_gap) * 3.0
+
+        # 3. 成功状态
+        if old_eval["success"] == 1 and new_eval["success"] == 0:
+            reward -= 3.0
+        elif old_eval["success"] == 0 and new_eval["success"] == 1:
+            reward += 2.0
+
+        # 4. 剔除奖励
+        reward += 0.1
+        return reward
+
+    def _final_bonus(self, final_eval):
+        bonus = 0.0
+        if final_eval["success"] == 1:
+            bonus += 2.0
+        bonus += max(final_eval["match_rates"]) * 3.0
+        return bonus
+
     def reset(self):
         idx = self.traj_cnt % len(self.traj)
         self.current_row = self.traj.iloc[[idx]].copy()
         self.traj_cnt += 1
         self.step_cnt = 0
-        self.finish = False
-        self.no_change_streak = 0
+        self.active_modes = list(modelist)
 
-        init_mode_mask = self._infer_init_mode_mask(idx)
+        # ID 序贯: 检测 ID 变化
+        cur_id = str(self.current_row['ID'].iat[0]).strip()
+        if cur_id != self._last_id:
+            self.current_id_history = []
+            self._last_id = cur_id
 
-        self.state = {
-            "previous": {
-                "mode": [1, 1, 1, 1],
-                "match_rate": [0.0, 0.0, 0.0, 0.0],
-                "multi_match_rate": 0.0,
-                "success": 0,
-                "steps": 0,
-                "path_len": 0.0,
-                "time": 0,
-                "distance": 0,
-                "velocity": 0,
-            },
-            "current": {
-                "mode": init_mode_mask,
-                "match_rate": [0.0, 0.0, 0.0, 0.0],
-                "multi_match_rate": 0.0,
-                "success": 0,
-                "steps": 0,
-                "path_len": 0.0,
-                "time": 0,
-                "distance": 0,
-                "velocity": 0,
-            }
+        # baseline 评估: 全部 4 modes
+        match_rates, multi_match, success, steps, path_len = self._run_PathMode(self.active_modes)
+        self.last_eval = {
+            "match_rates": match_rates,
+            "multi_match_rate": multi_match,
+            "success": success,
+            "steps": steps,
+            "path_len": path_len,
         }
 
+        self.state = {
+            "active_mode_mask": [1, 1, 1, 1],
+            "match_rates": match_rates,
+            "multi_match_rate": multi_match,
+            "success": success,
+            "steps": steps,
+            "distance_cells": self._norm_distance(self.current_row['distance_cells'].iat[0]),
+            "time": self._norm_time(self.current_row['time'].iat[0]),
+            "velocity": self._norm_velocity(self.current_row['velocity'].iat[0]),
+            "remaining_count": 4,
+            "prev_modes": self.current_id_history.copy(),
+        }
         return self.state
 
     def step(self, action):
         self.step_cnt += 1
-        reward = 0.0
+        mode_to_eliminate = modelist[action]
+        self.active_modes.remove(mode_to_eliminate)
 
-        self.state["previous"] = copy.deepcopy(self.state["current"])
-
-        time = float(self.current_row['time'].iat[0])
-        distance = float(self.current_row['distance_km'].iat[0])
-        velocity = float(self.current_row['velocity'].iat[0])
-
-        prev_mask = np.asarray(self.state["current"]["mode"], dtype=np.int64)
-        if int(prev_mask.sum()) == 0:
-            prev_mask[np.random.randint(0, 4)] = 1
-
-        # action: 0~14 → 4-bit mask
-        mask_int = int(action) + 1
-        cur_mask = np.array([
-            (mask_int >> 3) & 1,
-            (mask_int >> 2) & 1,
-            (mask_int >> 1) & 1,
-            mask_int & 1,
-        ], dtype=np.int64)
-        selected_modes = self._mask_to_modes(cur_mask)
-
-        changed = not np.array_equal(cur_mask, prev_mask)
-        if changed:
-            self.no_change_streak = 0
-        else:
-            self.no_change_streak += 1
-
-        match_rate, multi_match_rate, success, steps, path_len = self._run_PathMode(selected_modes)
-
-        reward += 0.2 * success
-        reward += multi_match_rate if multi_match_rate >= 0.6 else -1
-
-        for i in range(len(cur_mask)):
-            if cur_mask[i] == 1 and match_rate[i] == 0:
-                reward -= 1
-
-        reward += max(match_rate)
-        reward -= min(0.5 * cur_mask.sum(), 5)
-        reward += self._speed_deviation_reward(cur_mask, velocity)
-
-        self.state["current"] = {
-            "mode": cur_mask.tolist(),
-            "match_rate": match_rate,
-            "multi_match_rate": multi_match_rate,
-            "success": int(success),
-            "steps": int(steps),
-            "path_len": float(path_len),
-            "time": time,
-            "distance": distance,
-            "velocity": velocity,
+        # 用剩余 modes 跑 PathAgent
+        match_rates, multi_match, success, steps, path_len = self._run_PathMode(self.active_modes)
+        new_eval = {
+            "match_rates": match_rates,
+            "multi_match_rate": multi_match,
+            "success": success,
+            "steps": steps,
+            "path_len": path_len,
         }
 
-        if self.no_change_streak >= self.no_change_patience:
-            done = True
-            self.finish = True
-        elif hasattr(self, 'max_mode_steps') and self.step_cnt >= self.max_mode_steps:
-            done = True
-            reward -= 100
+        reward = self._elimination_reward(self.last_eval, new_eval)
+        self.last_eval = new_eval
+
+        done = (self.step_cnt >= 3)
+        if done:
+            reward += self._final_bonus(new_eval)
+            survived = self.active_modes[0]
+            self.current_id_history.append(survived)
+            if len(self.current_id_history) > self.history_len:
+                self.current_id_history = self.current_id_history[-self.history_len:]
+
+        active_mask = [1 if m in self.active_modes else 0 for m in modelist]
+        self.state = {
+            "active_mode_mask": active_mask,
+            "match_rates": match_rates,
+            "multi_match_rate": multi_match,
+            "success": success,
+            "steps": steps,
+            "distance_cells": self._norm_distance(self.current_row['distance_cells'].iat[0]),
+            "time": self._norm_time(self.current_row['time'].iat[0]),
+            "velocity": self._norm_velocity(self.current_row['velocity'].iat[0]),
+            "remaining_count": len(self.active_modes),
+            "prev_modes": self.current_id_history,
+        }
+
+        return self.state, float(reward), done, int(success)
+
+    def _true_mode(self):
+        if self.current_row is None or "mode" not in self.current_row.columns:
+            return None
+        return str(self.current_row["mode"].iat[0]).strip()
+
+    def _initial_belief(self):
+        prior = np.ones(len(modelist), dtype=np.float32)
+        for mode in self.current_id_history:
+            if mode in modelist:
+                prior[modelist.index(mode)] += 0.5
+        return prior / max(float(prior.sum()), 1e-8)
+
+    def _update_belief(self):
+        active_mask = np.array([1.0 if m in self.active_modes else 0.0 for m in modelist], dtype=np.float32)
+        if active_mask.sum() <= 0:
+            self.belief = np.ones(len(modelist), dtype=np.float32) / len(modelist)
+            return
+
+        old_logit = np.log(np.maximum(self.belief.astype(np.float32), 1e-6))
+        delta = np.array(self.delta_q, dtype=np.float32)
+        logits = self.belief_alpha * delta + self.belief_beta * old_logit
+        logits = np.where(active_mask > 0.0, logits, -1e9)
+        logits = logits - float(np.max(logits))
+        probs = np.exp(logits) * active_mask
+        denom = float(probs.sum())
+        if denom <= 1e-8:
+            probs = active_mask / float(active_mask.sum())
         else:
-            done = False
+            probs = probs / denom
+        self.belief = probs.astype(np.float32)
 
-        success = int(success)
+    def _predict_mode(self):
+        active_indices = [i for i, m in enumerate(modelist) if m in self.active_modes]
+        if not active_indices:
+            return modelist[int(np.argmax(self.belief))]
+        best_idx = max(active_indices, key=lambda i: float(self.belief[i]))
+        return modelist[best_idx]
 
-        return self.state, float(reward), done, success, multi_match_rate
+    def _refresh_counterfactual_state(self, update_belief=True):
+        base_eval, q_without, delta_q = self.evaluator.counterfactual_eval(
+            self.current_row,
+            self.active_modes,
+        )
+        self.last_eval = base_eval
+        self.q_base = float(base_eval["q"])
+        self.q_without = [float(v) for v in q_without]
+        self.delta_q = [float(v) for v in delta_q]
+        if update_belief:
+            self._update_belief()
+        self.pred_mode = self._predict_mode()
+
+    def _stop_allowed(self):
+        return 1
+
+    def _build_state(self):
+        active_mask = [1 if m in self.active_modes else 0 for m in modelist]
+        return {
+            "active_mode_mask": active_mask,
+            "belief": self.belief.astype(np.float32).tolist(),
+            "delta_q": [float(v) for v in self.delta_q],
+            "q_base": float(self.q_base),
+            "q_without": [float(v) for v in self.q_without],
+            "stop_allowed": int(self._stop_allowed()),
+            "match_rates": self.last_eval["match_rates"] if self.last_eval else [0.0 for _ in modelist],
+            "multi_match_rate": float(self.last_eval["multi_match_rate"]) if self.last_eval else 0.0,
+            "success": int(self.last_eval["success"]) if self.last_eval else 0,
+            "steps": int(self.last_eval["steps"]) if self.last_eval else 0,
+            "progress_score": float(self.last_eval["progress_score"]) if self.last_eval else 0.0,
+            "normalized_steps": float(self.last_eval["normalized_steps"]) if self.last_eval else 0.0,
+            "distance_cells": self._norm_distance(self.current_row['distance_cells'].iat[0]),
+            "time": self._norm_time(self.current_row['time'].iat[0]),
+            "velocity": self._norm_velocity(self.current_row['velocity'].iat[0]),
+            "remaining_count": len(self.active_modes),
+            "prev_modes": self.current_id_history.copy(),
+            "pred_mode": self.pred_mode,
+        }
+
+    def _finish_episode(self):
+        self.pred_mode = self._predict_mode()
+        if self.pred_mode in modelist:
+            self.current_id_history.append(self.pred_mode)
+            if len(self.current_id_history) > self.history_len:
+                self.current_id_history = self.current_id_history[-self.history_len:]
+
+    def invalid_action_mask(self):
+        mask = np.zeros(len(modelist) + 1, dtype=bool)
+        for idx, mode in enumerate(modelist):
+            if mode not in self.active_modes or len(self.active_modes) <= 1:
+                mask[idx] = True
+        if not self._stop_allowed():
+            mask[self.stop_action] = True
+        return mask
+
+    def _run_PathMode(self, selected_modes):
+        result = self.evaluator.evaluate(self.current_row, selected_modes)
+        return (
+            result["match_rates"],
+            result["multi_match_rate"],
+            result["success"],
+            result["steps"],
+            result["path_len"],
+        )
+
+    def _stop_reward(self):
+        belief = np.maximum(self.belief.astype(np.float32), 1e-8)
+        entropy = -float(np.sum(belief * np.log(belief)))
+        confidence = float(np.max(belief))
+        sparsity_penalty = 0.1 * float(max(len(self.active_modes) - 1, 0))
+        reward = float(self.q_base) + 0.5 * confidence - 0.2 * entropy - sparsity_penalty
+        return float(np.clip(reward, -3.0, 3.0))
+
+    def reset(self):
+        if self.train_mode:
+            idx = self._next_episode_index()
+        else:
+            idx = self.traj_cnt % len(self.traj)
+            self.traj_cnt += 1
+        self.current_row = self.traj.iloc[[idx]].copy()
+        self.step_cnt = 0
+        self.active_modes = list(modelist)
+        self.q_base = 0.0
+        self.q_without = [0.0 for _ in modelist]
+        self.delta_q = [0.0 for _ in modelist]
+        self.pred_mode = None
+
+        cur_id = str(self.current_row['ID'].iat[0]).strip()
+        if cur_id != self._last_id:
+            self.current_id_history = []
+            self._last_id = cur_id
+
+        self.belief = self._initial_belief()
+        self._refresh_counterfactual_state(update_belief=True)
+        self.state = self._build_state()
+        return self.state
+
+    def step(self, action):
+        self.step_cnt += 1
+
+        if action == self.stop_action:
+            reward = self._stop_reward()
+            reward -= 0.05
+            self._finish_episode()
+            self.state = self._build_state()
+            return self.state, float(reward), True, int(self.state["success"])
+
+        invalid = (
+            action < 0
+            or action >= len(modelist)
+            or modelist[action] not in self.active_modes
+            or len(self.active_modes) <= 1
+        )
+        if invalid:
+            reward = -2.0 - 0.05
+            done = self.step_cnt >= self.max_mode_steps
+            if done:
+                self._finish_episode()
+            self.state = self._build_state()
+            return self.state, float(reward), done, int(self.state["success"])
+
+        removed_mode = modelist[action]
+        delta_removed = float(self.delta_q[action])
+        self.active_modes.remove(removed_mode)
+        self._refresh_counterfactual_state(update_belief=True)
+
+        reward = -delta_removed + 0.1
+        reward -= 0.05
+        reward = float(np.clip(reward, -3.0, 3.0))
+
+        done = self.step_cnt >= self.max_mode_steps
+        if done:
+            reward += self._stop_reward()
+            reward = float(np.clip(reward, -3.0, 3.0))
+            self._finish_episode()
+
+        self.state = self._build_state()
+        return self.state, float(reward), done, int(self.state["success"])
 
 
 if __name__ == "__main__":

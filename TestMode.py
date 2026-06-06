@@ -16,19 +16,13 @@ MODE_LIST = ["GSD", "GG", "TS", "TG"]
 @dataclass
 class TestModeConfig:
     model_path: str = "ModeModel/dqn_mode_final.pth"
-    traj_path: str = "data/data_lower_test.csv"
-    map_path: str = "data/GridModesAdjacentRealworld.pkl"
-    path_model_path: str = "PathModel/PathModel.pth"
+    traj_path: str = "data/artificial_od_all.csv"
+    map_path: str = "data/hex_grid.pkl"
+    path_model_path: str = "PathModel/sac_actor_ep5000_withConv_withCurri.pth"
     save_dir: str = "ModeModel/test_results"
     episodes: int = 0  # 0 表示使用测试集全量
-    max_episode_steps: int = 50
     metrics_window: int = 100
     seed: int = 42
-
-
-def _selected_modes_from_state(state):
-    mode_vec = state.get("current", {}).get("mode", [0, 0, 0, 0])
-    return [MODE_LIST[i] for i, v in enumerate(mode_vec) if int(v) == 1]
 
 
 def evaluate_mode_dqn(cfg: TestModeConfig):
@@ -42,7 +36,8 @@ def evaluate_mode_dqn(cfg: TestModeConfig):
 
     traj = pd.read_csv(cfg.traj_path)
     if "velocity" not in traj.columns:
-        traj["velocity"] = traj["distance"] / traj["time"].replace(0, np.nan)
+        dist_col = "distance_m" if "distance_m" in traj.columns else "distance"
+        traj["velocity"] = traj[dist_col] / traj["time"].replace(0, np.nan)
         traj["velocity"] = traj["velocity"].fillna(0.0)
 
     env = ModeEnv(
@@ -52,17 +47,21 @@ def evaluate_mode_dqn(cfg: TestModeConfig):
         train_mode=False,
         fov=5,
         distance_threshold=1.0,
+        use_conv=False,
     )
 
-    # 用一次 reset 推断 state_dim，然后把计数复位，保证从第 0 条样本开始评估
+    # 用一次 reset 推断 state_dim，然后把计数复位
     s0 = env.reset()
     s0_vec = mode_state_to_vector(s0)
-    env.traj_cnt = 0
+    if hasattr(env, "reset_episode_order"):
+        env.reset_episode_order()
+    else:
+        env.traj_cnt = 0
 
     dqn_cfg = DQNConfig(
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
-    agent = DQNAgent(state_dim=s0_vec.shape[0], action_dim=15, cfg=dqn_cfg)
+    agent = DQNAgent(state_dim=s0_vec.shape[0], action_dim=5, cfg=dqn_cfg)
     agent.load(cfg.model_path)
     agent.q.eval()
     agent.q_tgt.eval()
@@ -71,10 +70,13 @@ def evaluate_mode_dqn(cfg: TestModeConfig):
 
     rewards = []
     successes = []
-    finishes = []
-    matches = []
-    mode_hits = []
-    step_counts = []
+    mode_correct_list = []
+    true_mode_list = []
+    survived_mode_list = []
+    pred_mode_list = []
+    stop_step_list = []
+
+    per_mode_correct = {m: [] for m in MODE_LIST}
 
     rows = []
 
@@ -90,77 +92,110 @@ def evaluate_mode_dqn(cfg: TestModeConfig):
 
             ep_reward = 0.0
             succ = 0
-            multi_match_rate = 0.0
 
-            for _ in range(cfg.max_episode_steps):
-                a = agent.select_action(s_vec, evaluate=True)
-                ns, r, done, succ, multi_match_rate = env.step(int(a))
+            stop_step = env.max_mode_steps
+            for mode_step in range(1, env.max_mode_steps + 1):
+                invalid_actions = set(np.where(env.invalid_action_mask())[0])
+                a = agent.select_action(s_vec, invalid_actions=invalid_actions, evaluate=True)
+                ns, r, done, succ = env.step(int(a))
                 s_vec = mode_state_to_vector(ns)
                 ep_reward += float(r)
+                if int(a) == env.stop_action or done:
+                    stop_step = mode_step
                 if done:
                     break
 
             true_mode = None
+            traj_id = ""
+            if getattr(env, "current_row", None) is not None and "ID" in env.current_row.columns:
+                traj_id = str(env.current_row["ID"].iat[0]).strip()
             if getattr(env, "current_row", None) is not None and "mode" in env.current_row.columns:
                 true_mode = str(env.current_row["mode"].iat[0]).strip()
 
-            selected_modes = _selected_modes_from_state(env.state)
-            mode_hit = int(true_mode in selected_modes) if true_mode is not None else 0
+            survived_mode = env.active_modes[0] if len(env.active_modes) == 1 else ""
+            pred_mode = env.state.get("pred_mode", "")
+            mode_correct = int(pred_mode == true_mode) if true_mode in MODE_LIST else np.nan
+            state = env.state
+            match_rates = state.get("match_rates", [0, 0, 0, 0])
+            multi_match = state.get("multi_match_rate", 0.0)
+            delta_q = state.get("delta_q", [0, 0, 0, 0])
+            belief = state.get("belief", [0, 0, 0, 0])
 
             rewards.append(ep_reward)
             successes.append(int(succ))
-            finishes.append(int(env.finish))
-            matches.append(float(multi_match_rate))
-            mode_hits.append(mode_hit)
-            step_counts.append(int(env.step_cnt))
+            mode_correct_list.append(mode_correct)
+            true_mode_list.append(true_mode)
+            survived_mode_list.append(survived_mode)
+            pred_mode_list.append(pred_mode)
+            stop_step_list.append(stop_step)
+
+            if true_mode in per_mode_correct:
+                per_mode_correct[true_mode].append(mode_correct)
 
             w = cfg.metrics_window
             avg_reward_w = float(np.mean(rewards[-w:]))
             succ_rate_w = float(np.mean(successes[-w:]) * 100.0)
-            finish_rate_w = float(np.mean(finishes[-w:]) * 100.0)
-            mode_acc_w = float(np.mean(mode_hits[-w:]) * 100.0)
-            match_rate_w = float(np.mean(matches[-w:]) * 100.0)
+            recent_correct = [v for v in mode_correct_list[-w:] if not np.isnan(v)]
+            mode_acc_w = float(np.mean(recent_correct) * 100.0) if recent_correct else np.nan
+
+            def fmt_arr(arr):
+                return "[" + ", ".join(f"{float(v):.3f}" for v in arr) + "]"
 
             log.write(
                 f"[Episode {ep:05d}] "
-                f"reward={ep_reward:.3f}, "
-                f"avg_reward_{w}={avg_reward_w:.3f}, "
-                f"succ_rate_{w}={succ_rate_w:.2f}%, "
-                f"finish_rate_{w}={finish_rate_w:.2f}%, "
-                f"mode_acc_{w}={mode_acc_w:.2f}%, "
-                f"match_rate_{w}={match_rate_w:.2f}%\n"
-                f"true_mode={true_mode}, selected_modes={selected_modes}, "
-                f"success={int(succ)}, finish={env.finish}, steps={env.step_cnt}, "
-                f"multi_match={multi_match_rate:.4f}\n"
-                + "-" * 90
-                + "\n"
+                f"reward={ep_reward:.3f}  "
+                f"avg_reward_{{{w}}}={avg_reward_w:.3f}  "
+                f"succ_rate_{{{w}}}={succ_rate_w:.2f}%  "
+                f"mode_acc_{{{w}}}={mode_acc_w:.2f}%\n"
+                f"  ID={traj_id}  true={true_mode}  pred={pred_mode}  "
+                f"correct={mode_correct}  q_base={state.get('q_base', 0.0):.3f}\n"
+                f"  multi_match={float(multi_match):.3f}  "
+                f"match_GSD={float(match_rates[0]):.3f}  "
+                f"match_GG={float(match_rates[1]):.3f}  "
+                f"match_TS={float(match_rates[2]):.3f}  "
+                f"match_TG={float(match_rates[3]):.3f}\n"
+                f"  delta_q = {fmt_arr(delta_q)}\n"
+                f"  belief  = {fmt_arr(belief)}\n"
+                f"  stop_step={stop_step}  active={env.active_modes}  "
+                f"prev_modes={env.current_id_history}\n"
+                + "-" * 90 + "\n"
             )
 
             print(
                 f"[Ep {ep:05d}/{n_episodes}] "
-                f"reward={ep_reward:.3f}, success={int(succ)}, finish={env.finish}, "
-                f"steps={env.step_cnt}, true_mode={true_mode}, "
-                f"selected={selected_modes}, mode_hit={mode_hit}"
+                f"reward={ep_reward:.3f}, success={int(succ)}, "
+                f"true_mode={true_mode}, pred={pred_mode}, "
+                f"correct={mode_correct}"
             )
 
-            rows.append(
-                {
-                    "episode": ep,
-                    "reward": float(ep_reward),
-                    "success": int(succ),
-                    "finish": int(env.finish),
-                    "step_count": int(env.step_cnt),
-                    "true_mode": true_mode,
-                    "selected_modes": "+".join(selected_modes),
-                    "mode_hit": mode_hit,
-                    "multi_match_rate": float(multi_match_rate),
-                    "avg_reward_w": avg_reward_w,
-                    "succ_rate_w": succ_rate_w,
-                    "finish_rate_w": finish_rate_w,
-                    "mode_acc_w": mode_acc_w,
-                    "match_rate_w": match_rate_w,
-                }
-            )
+            rows.append({
+                "episode": ep,
+                "reward": float(ep_reward),
+                "success": int(succ),
+                "ID": traj_id,
+                "true_mode": true_mode,
+                "labeled": int(true_mode in MODE_LIST),
+                "survived_mode": survived_mode,
+                "pred_mode": pred_mode,
+                "mode_correct": mode_correct,
+                "stop_step": stop_step,
+                "q_base": float(state.get("q_base", 0.0)),
+                "multi_match": float(multi_match),
+                "match_GSD": float(match_rates[0]),
+                "match_GG": float(match_rates[1]),
+                "match_TS": float(match_rates[2]),
+                "match_TG": float(match_rates[3]),
+                "belief_GSD": float(belief[0]),
+                "belief_GG": float(belief[1]),
+                "belief_TS": float(belief[2]),
+                "belief_TG": float(belief[3]),
+                "delta_q_GSD": float(delta_q[0]),
+                "delta_q_GG": float(delta_q[1]),
+                "delta_q_TS": float(delta_q[2]),
+                "delta_q_TG": float(delta_q[3]),
+                "active_modes": str(env.active_modes),
+                "prev_modes": str(env.current_id_history),
+            })
 
     metrics_df = pd.DataFrame(rows)
     metrics_csv = os.path.join(cfg.save_dir, "test_metrics.csv")
@@ -170,7 +205,8 @@ def evaluate_mode_dqn(cfg: TestModeConfig):
 
     plt.figure(figsize=(10, 5))
     plt.plot(episodes_x, metrics_df["reward"], label="Episode Reward", alpha=0.4)
-    plt.plot(episodes_x, metrics_df["avg_reward_w"], label=f"Avg Reward (Last {cfg.metrics_window})", linewidth=2)
+    plt.plot(episodes_x, metrics_df["reward"].rolling(cfg.metrics_window, min_periods=1).mean(),
+             label=f"Avg Reward (Last {cfg.metrics_window})", linewidth=2)
     plt.xlabel("Episode")
     plt.ylabel("Reward")
     plt.title("Mode-DQN Test Reward Curves")
@@ -181,17 +217,15 @@ def evaluate_mode_dqn(cfg: TestModeConfig):
     plt.close()
 
     plt.figure(figsize=(10, 5))
-    plt.plot(episodes_x, metrics_df["succ_rate_w"], label="Success Rate %", linewidth=2)
-    plt.plot(episodes_x, metrics_df["finish_rate_w"], label="Finish Rate %", linewidth=2)
-    plt.plot(episodes_x, metrics_df["mode_acc_w"], label="Mode Accuracy %", linewidth=2)
-    plt.plot(episodes_x, metrics_df["match_rate_w"], label="Match Rate %", linewidth=2)
+    plt.plot(episodes_x, metrics_df["mode_correct"].rolling(cfg.metrics_window, min_periods=1).mean() * 100,
+             label="Mode Accuracy %", linewidth=2)
     plt.xlabel("Episode")
     plt.ylabel("Rate (%)")
-    plt.title("Mode-DQN Test Metrics Curves")
+    plt.title("Mode-DQN Test Mode Accuracy")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(cfg.save_dir, "test_metric_curves.png"), dpi=200)
+    plt.savefig(os.path.join(cfg.save_dir, "test_accuracy_curves.png"), dpi=200)
     plt.close()
 
     print("=" * 60)
@@ -199,9 +233,15 @@ def evaluate_mode_dqn(cfg: TestModeConfig):
     print(f"Saved metrics : {metrics_csv}")
     print(f"Avg reward    : {np.mean(rewards):.3f}")
     print(f"Success rate  : {np.mean(successes) * 100.0:.2f}%")
-    print(f"Finish rate   : {np.mean(finishes) * 100.0:.2f}%")
-    print(f"Mode accuracy : {np.mean(mode_hits) * 100.0:.2f}%")
-    print(f"Match rate    : {np.mean(matches) * 100.0:.2f}%")
+    labeled_correct = [v for v in mode_correct_list if not np.isnan(v)]
+    if labeled_correct:
+        print(f"Mode accuracy : {np.mean(labeled_correct) * 100.0:.2f}%")
+    else:
+        print("Mode accuracy : N/A (unlabeled)")
+    print("- Per mode accuracy:")
+    for m in MODE_LIST:
+        if per_mode_correct[m]:
+            print(f"  {m}: {np.mean(per_mode_correct[m]) * 100.0:.2f}% ({len(per_mode_correct[m])} samples)")
     print("=" * 60)
 
     return metrics_df
@@ -210,12 +250,11 @@ def evaluate_mode_dqn(cfg: TestModeConfig):
 if __name__ == "__main__":
     test_cfg = TestModeConfig(
         model_path="ModeModel/dqn_mode_final.pth",
-        traj_path="data/data_lower_test.csv",
-        map_path="data/GridModesAdjacentRealworld.pkl",
-        path_model_path="PathModel/PathModel.pth",
+        traj_path="data/artificial_od_all.csv",
+        map_path="data/hex_grid.pkl",
+        path_model_path="PathModel/sac_actor_ep5000_withConv_withCurri.pth",
         save_dir="ModeModel/test_results",
         episodes=0,
-        max_episode_steps=50,
         metrics_window=100,
         seed=42,
     )

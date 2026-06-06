@@ -20,9 +20,11 @@ USE_GNN = False
 MAX_STEPS = 300
 SAVE_FIGURES = 15  # True=全部保存, False/0=不保存, N=每种mode保存N个ID的图像
 
-# True: 测试时使用 row['mode'] 作为唯一选中模式
-# False: 保持环境原有随机 mode 采样
-USE_ROW_MODE_FROM_DATA = True
+# 测试时的 mode 选择方式:
+# 'all'   - 使用全部 4 种 mode（全模式复合路网）
+# 'true'  - 使用 row['mode'] 作为唯一选中模式
+# 'random' - 保持环境原有随机 mode 采样
+TEST_MODE_SELECTION = 'all'
 
 MODE_COLORS = {"TG": "purple", "GG": "blue", "GSD": "green", "TS": "red"}
 
@@ -347,12 +349,12 @@ def plot_combined_for_id(items, tid, save_dir, mapdata=None):
     print(f"[Combined] ID={tid}, {len(items)} segments -> {save_path}")
 
 
-def load_env(traj_df, use_row_mode_from_data: bool = False, fov: int = 3):
+def load_env(traj_df, test_mode_selection: str = 'all', fov: int = 3):
     from utils.hex_utils import load_hex_mapdata_raw
     mapdata = load_hex_mapdata_raw('data/hex_grid.pkl')
     build_hex_lonlat_index(mapdata)
     env = PathEnv(
-        train_mode=not use_row_mode_from_data,
+        train_mode=(test_mode_selection == 'random'),
         mapdata=mapdata,
         traj=traj_df,
         FOV=fov,
@@ -374,7 +376,7 @@ def load_agent(env, model_path: str, use_gnn: bool = True):
 
 
 def run_eval(env, agent, traj_df, max_steps: int, save_dir: str,
-             save_figures=True):
+             save_figures=True, test_mode_selection='all'):
     os.makedirs(save_dir, exist_ok=True)
 
     episodes = len(traj_df)
@@ -435,8 +437,10 @@ def run_eval(env, agent, traj_df, max_steps: int, save_dir: str,
             else:
                 id_save_eligible = False
 
-        if USE_ROW_MODE_FROM_DATA:
+        if test_mode_selection == 'true':
             env.selected_mode = np.array([real_mode])
+        elif test_mode_selection == 'all':
+            env.selected_mode = np.array(list(MODE_COLORS.keys()))
 
         state = env.reset()
         hex_start = env.hex_start
@@ -559,7 +563,7 @@ if __name__ == "__main__":
     traj_df = pd.read_csv(TRAJ_CSV)
     print(f"Loaded {len(traj_df)} trajectories from {TRAJ_CSV}")
 
-    env = load_env(traj_df, use_row_mode_from_data=USE_ROW_MODE_FROM_DATA, fov=FOV)
+    env = load_env(traj_df, test_mode_selection=TEST_MODE_SELECTION, fov=FOV)
 
     print(f"Loading model: {MODEL_PATH}")
     if not os.path.exists(MODEL_PATH):
@@ -576,4 +580,4 @@ if __name__ == "__main__":
     agent = load_agent(env, MODEL_PATH, use_gnn=USE_GNN)
     print(f"Running evaluation, saving to {SAVE_DIR}/")
     run_eval(env, agent, traj_df, max_steps=MAX_STEPS, save_dir=SAVE_DIR,
-             save_figures=SAVE_FIGURES)
+             save_figures=SAVE_FIGURES, test_mode_selection=TEST_MODE_SELECTION)

@@ -10,21 +10,25 @@ import torch.nn.functional as F
 
 
 class ReplayBuffer:
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, action_dim: int = 5):
         self.buffer = deque(maxlen=capacity)
+        self.action_dim = int(action_dim)
 
-    def push(self, s, a, r, ns, d):
-        self.buffer.append((s, a, r, ns, d))
+    def push(self, s, a, r, ns, d, invalid_mask=None):
+        if invalid_mask is None:
+            invalid_mask = np.zeros(self.action_dim, dtype=bool)
+        self.buffer.append((s, a, r, ns, d, invalid_mask))
 
     def sample(self, batch_size: int):
         batch = random.sample(self.buffer, batch_size)
-        s, a, r, ns, d = zip(*batch)
+        s, a, r, ns, d, im = zip(*batch)
         return (
             np.array(s, dtype=np.float32),
             np.array(a, dtype=np.int64),
             np.array(r, dtype=np.float32),
             np.array(ns, dtype=np.float32),
             np.array(d, dtype=np.float32),
+            np.array(im, dtype=bool),
         )
 
     def __len__(self):
@@ -73,46 +77,97 @@ def _safe_get(d: Dict[str, Any], key: str, default=0.0):
     return np.array([float(v)], dtype=np.float32)
 
 
+MODELIST = ['GSD', 'GG', 'TS', 'TG']
+
+
 def mode_state_to_vector(state: Dict[str, Any]) -> np.ndarray:
     """
-    ModeEnv state 展平:
-    previous: mode(4), match_rate(4), multi_match_rate, success, steps, path_len, time, distance, velocity
-    current : mode(4), match_rate(4), multi_match_rate, success, steps, path_len, time, distance, velocity
+    ModeEnv state 展平 (剔除式 MDP, 23 维):
+    active_mode_mask(4), match_rates(4), multi_match_rate(1), success(1), steps(1),
+    distance_cells(1), time(1), velocity(1), remaining_count(1),
+    prev_mode_1_onehot(4), prev_mode_2_onehot(4)
     """
-    prev = state.get("previous", {})
-    cur = state.get("current", {})
+    prev = state.get("prev_modes", [])
 
-    prev_vec = np.concatenate(
-        [
-            _safe_get(prev, "mode", [0, 0, 0, 0]),
-            _safe_get(prev, "match_rate", [0, 0, 0, 0]),
-            _safe_get(prev, "multi_match_rate", 0.0),
-            _safe_get(prev, "success", 0.0),
-            _safe_get(prev, "steps", 0.0),
-            _safe_get(prev, "path_len", 0.0),
-            _safe_get(prev, "time", 0.0),
-            _safe_get(prev, "distance", 0.0),
-            _safe_get(prev, "velocity", 0.0),
-        ],
-        axis=0,
-    )
+    active_mask = np.array(state.get("active_mode_mask", [1, 1, 1, 1]), dtype=np.float32)
+    match_rates = np.array(state.get("match_rates", [0, 0, 0, 0]), dtype=np.float32)
+    multi_match = np.array([float(state.get("multi_match_rate", 0.0))], dtype=np.float32)
+    success = np.array([float(state.get("success", 0))], dtype=np.float32)
+    steps = np.array([float(state.get("steps", 0))], dtype=np.float32)
+    dist = np.array([float(state.get("distance_cells", 0.0))], dtype=np.float32)
+    time_f = np.array([float(state.get("time", 0.0))], dtype=np.float32)
+    vel = np.array([float(state.get("velocity", 0.0))], dtype=np.float32)
+    remaining = np.array([float(state.get("remaining_count", 4))], dtype=np.float32)
 
-    cur_vec = np.concatenate(
-        [
-            _safe_get(cur, "mode", [0, 0, 0, 0]),
-            _safe_get(cur, "match_rate", [0, 0, 0, 0]),
-            _safe_get(cur, "multi_match_rate", 0.0),
-            _safe_get(cur, "success", 0.0),
-            _safe_get(cur, "steps", 0.0),
-            _safe_get(cur, "path_len", 0.0),
-            _safe_get(cur, "time", 0.0),
-            _safe_get(cur, "distance", 0.0),
-            _safe_get(cur, "velocity", 0.0),
-        ],
-        axis=0,
-    )
+    prev_1 = np.zeros(4, dtype=np.float32)
+    prev_2 = np.zeros(4, dtype=np.float32)
+    if len(prev) >= 1 and prev[-1] in MODELIST:
+        prev_1[MODELIST.index(prev[-1])] = 1.0
+    if len(prev) >= 2 and prev[-2] in MODELIST:
+        prev_2[MODELIST.index(prev[-2])] = 1.0
 
-    return np.concatenate([prev_vec, cur_vec], axis=0).astype(np.float32)
+    return np.concatenate([
+        active_mask, match_rates, multi_match, success, steps,
+        dist, time_f, vel, remaining,
+        prev_1, prev_2
+    ]).astype(np.float32)
+
+
+def mode_state_to_vector(state: Dict[str, Any]) -> np.ndarray:
+    """
+    Counterfactual ModeEnv state vector.
+
+    Layout:
+    active_mask(4), belief(4), delta_q(4), q_base(1), q_without(4),
+    stop_allowed(1), match_rates(4), multi_match/success/steps/progress/nsteps(5),
+    distance/time/velocity/remaining(4), prev_mode onehots(8).
+    """
+    prev = state.get("prev_modes", [])
+
+    active_mask = np.array(state.get("active_mode_mask", [1, 1, 1, 1]), dtype=np.float32)
+    belief = np.array(state.get("belief", [0.25, 0.25, 0.25, 0.25]), dtype=np.float32)
+    delta_q = np.array(state.get("delta_q", [0, 0, 0, 0]), dtype=np.float32)
+    q_base = np.array([float(state.get("q_base", 0.0))], dtype=np.float32)
+    q_without = np.array(state.get("q_without", [0, 0, 0, 0]), dtype=np.float32)
+    stop_allowed = np.array([float(state.get("stop_allowed", 1))], dtype=np.float32)
+    match_rates = np.array(state.get("match_rates", [0, 0, 0, 0]), dtype=np.float32)
+    multi_match = np.array([float(state.get("multi_match_rate", 0.0))], dtype=np.float32)
+    success = np.array([float(state.get("success", 0))], dtype=np.float32)
+    steps = np.array([float(state.get("steps", 0))], dtype=np.float32)
+    progress = np.array([float(state.get("progress_score", 0.0))], dtype=np.float32)
+    normalized_steps = np.array([float(state.get("normalized_steps", 0.0))], dtype=np.float32)
+    dist = np.array([float(state.get("distance_cells", 0.0))], dtype=np.float32)
+    time_f = np.array([float(state.get("time", 0.0))], dtype=np.float32)
+    vel = np.array([float(state.get("velocity", 0.0))], dtype=np.float32)
+    remaining = np.array([float(state.get("remaining_count", 4))], dtype=np.float32)
+
+    prev_1 = np.zeros(4, dtype=np.float32)
+    prev_2 = np.zeros(4, dtype=np.float32)
+    if len(prev) >= 1 and prev[-1] in MODELIST:
+        prev_1[MODELIST.index(prev[-1])] = 1.0
+    if len(prev) >= 2 and prev[-2] in MODELIST:
+        prev_2[MODELIST.index(prev[-2])] = 1.0
+
+    return np.concatenate([
+        active_mask,
+        belief,
+        delta_q,
+        q_base,
+        q_without,
+        stop_allowed,
+        match_rates,
+        multi_match,
+        success,
+        steps,
+        progress,
+        normalized_steps,
+        dist,
+        time_f,
+        vel,
+        remaining,
+        prev_1,
+        prev_2,
+    ]).astype(np.float32)
 
 
 class DQNAgent:
@@ -127,7 +182,7 @@ class DQNAgent:
         self.q_tgt.eval()
 
         self.optim = torch.optim.Adam(self.q.parameters(), lr=cfg.lr)
-        self.replay = ReplayBuffer(cfg.buffer_size)
+        self.replay = ReplayBuffer(cfg.buffer_size, self.action_dim)
 
         self.total_steps = 0
 
@@ -137,32 +192,45 @@ class DQNAgent:
         return self.cfg.eps_start + frac * (self.cfg.eps_end - self.cfg.eps_start)
 
     @torch.no_grad()
-    def select_action(self, state_vec: np.ndarray, evaluate: bool = False) -> int:
+    def select_action(self, state_vec: np.ndarray, evaluate: bool = False,
+                      invalid_actions=None) -> int:
+        valid = [i for i in range(self.action_dim)
+                 if invalid_actions is None or i not in invalid_actions]
+        if not valid:
+            valid = [0]
+
         if (not evaluate) and (random.random() < self.epsilon()):
-            return random.randint(0, self.action_dim - 1)
+            return random.choice(valid)
 
         s = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
-        q = self.q(s)
-        a = int(torch.argmax(q, dim=-1).item())
-        return a
+        q = self.q(s).squeeze(0)
+        if invalid_actions:
+            q[list(invalid_actions)] = -float('inf')
+        return int(torch.argmax(q).item())
 
     def update(self):
         if len(self.replay) < self.cfg.batch_size:
             return {}
 
-        s, a, r, ns, d = self.replay.sample(self.cfg.batch_size)
+        s, a, r, ns, d, im = self.replay.sample(self.cfg.batch_size)
         s = torch.tensor(s, dtype=torch.float32, device=self.device)
         a = torch.tensor(a, dtype=torch.int64, device=self.device).unsqueeze(-1)
         r = torch.tensor(r, dtype=torch.float32, device=self.device).unsqueeze(-1)
         ns = torch.tensor(ns, dtype=torch.float32, device=self.device)
         d = torch.tensor(d, dtype=torch.float32, device=self.device).unsqueeze(-1)
+        im = torch.tensor(im, dtype=torch.bool, device=self.device)
 
         q_sa = self.q(s).gather(1, a)
 
         with torch.no_grad():
             # Double DQN: next action from online net, next value from target net
-            next_a = torch.argmax(self.q(ns), dim=-1, keepdim=True)
-            next_q = self.q_tgt(ns).gather(1, next_a)
+            next_q_online = self.q(ns)
+            next_q_tgt = self.q_tgt(ns)
+            # 应用 next state 的 invalid mask（使用 masked_fill 避免形状问题）
+            next_q_online = next_q_online.masked_fill(im, -float('inf'))
+            next_q_tgt = next_q_tgt.masked_fill(im, -float('inf'))
+            next_a = torch.argmax(next_q_online, dim=-1, keepdim=True)
+            next_q = next_q_tgt.gather(1, next_a)
             y = r + (1.0 - d) * self.cfg.gamma * next_q
 
         loss = F.smooth_l1_loss(q_sa, y)
@@ -202,7 +270,7 @@ def train_dqn_on_modeenv(
     s0_vec = mode_state_to_vector(s0)
 
     state_dim = s0_vec.shape[0]
-    action_dim = 15  # 4bit mode 组合 (1~15, 排除全零)
+    action_dim = 5  # 0-3 remove mode, 4 stop
 
     agent = DQNAgent(state_dim, action_dim, cfg)
 
@@ -221,15 +289,18 @@ def train_dqn_on_modeenv(
         for _ in range(max_episode_steps):
             agent.total_steps += 1
 
+            invalid_actions = set(np.where(env.invalid_action_mask())[0]) if hasattr(env, "invalid_action_mask") else set()
             if agent.total_steps < cfg.start_steps:
-                a = random.randint(0, action_dim - 1)
+                valid = [i for i in range(action_dim) if i not in invalid_actions]
+                a = random.choice(valid) if valid else action_dim - 1
             else:
-                a = agent.select_action(s_vec, evaluate=False)
+                a = agent.select_action(s_vec, evaluate=False, invalid_actions=invalid_actions)
 
             ns, r, done, succ = env.step(a)
             ns_vec = mode_state_to_vector(ns)
 
-            agent.replay.push(s_vec, a, float(r), ns_vec, float(done))
+            invalid_mask = env.invalid_action_mask() if hasattr(env, "invalid_action_mask") else np.zeros(action_dim, dtype=bool)
+            agent.replay.push(s_vec, a, float(r), ns_vec, float(done), invalid_mask)
             s_vec = ns_vec
 
             if agent.total_steps % cfg.train_freq == 0:
