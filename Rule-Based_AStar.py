@@ -135,28 +135,31 @@ def eval_single_mode(road_map, hex_start, hex_end, distance_threshold=1.0):
 # Viterbi
 # ============================================================
 
-def build_transition_matrix(traj, smooth=1.0):
-    """从数据统计转移概率矩阵，加平滑。"""
-    counts = np.full((4, 4), smooth, dtype=np.float64)
-    if 'mode' not in traj.columns:
-        return counts / counts.sum(axis=1, keepdims=True)
-    modes = traj['mode'].astype(str).str.strip().values
-    ids = traj['ID'].astype(str).str.strip().values if 'ID' in traj.columns else None
-    for i in range(1, len(modes)):
-        if ids is not None and ids[i] != ids[i - 1]:
-            continue
-        if modes[i] in modelist and modes[i - 1] in modelist:
-            prev_idx = modelist.index(modes[i - 1])
-            cur_idx = modelist.index(modes[i])
-            counts[prev_idx][cur_idx] += 1.0
-    row_sums = counts.sum(axis=1, keepdims=True)
-    return counts / row_sums
+def build_transition_matrix(stay_prob=0.9):
+    """固定转移概率矩阵：对角线 stay_prob，其余均分。"""
+    n = len(modelist)
+    off = (1.0 - stay_prob) / (n - 1)
+    mat = np.full((n, n), off, dtype=np.float64)
+    np.fill_diagonal(mat, stay_prob)
+    return mat
 
 
-def viterbi_decode(scores_seq, trans_mat, init_prob=None):
+def speed_change_score_matrix(vel_prev, vel_cur, sigma=30.0):
+    """计算速度变化得分矩阵。如果 vel_cur - vel_prev 与 mode_i→mode_j 的期望速度差一致，得分高。"""
+    vel_diff = vel_cur - vel_prev
+    sc = np.zeros((len(modelist), len(modelist)), dtype=np.float64)
+    for i, m_prev in enumerate(modelist):
+        for j, m_cur in enumerate(modelist):
+            expected_diff = MODE_VEL_MEAN[m_cur] - MODE_VEL_MEAN[m_prev]
+            sc[i][j] = math.exp(-0.5 * (vel_diff - expected_diff) ** 2 / (sigma ** 2))
+    return sc
+
+
+def viterbi_decode(scores_seq, trans_mat, vel_seq=None, init_prob=None):
     """
     scores_seq: list of [score_mode0, score_mode1, ...] 每段的观测分数
     trans_mat: 4x4 转移概率矩阵
+    vel_seq: list of float, 每段的速度（可选，用于速度变化信号）
     init_prob: 1x4 初始概率，默认均匀
     返回: list of mode indices
     """
@@ -182,7 +185,12 @@ def viterbi_decode(scores_seq, trans_mat, init_prob=None):
     for t in range(1, n):
         for j in range(n_modes):
             obs = max(scores_seq[t][j], 1e-8)
-            candidates = V[t - 1] + log_trans[:, j] + np.log(obs)
+            log_obs = np.log(obs)
+            if vel_seq and vel_seq[t] > 0 and vel_seq[t - 1] > 0:
+                sc = speed_change_score_matrix(vel_seq[t - 1], vel_seq[t])
+                candidates = V[t - 1] + log_trans[:, j] + np.log(sc[:, j] + 1e-12) + log_obs
+            else:
+                candidates = V[t - 1] + log_trans[:, j] + log_obs
             backptr[t][j] = int(np.argmax(candidates))
             V[t][j] = candidates[backptr[t][j]]
 
@@ -198,10 +206,11 @@ def viterbi_decode(scores_seq, trans_mat, init_prob=None):
 # 主流程
 # ============================================================
 
-def evaluate_all(traj_path='data/artificial_od_single.csv',
+def evaluate_all(traj_path='data/artificial_od_mult.csv',
                  map_path='data/hex_grid.pkl',
                  output_dir='SimpleModeResult',
-                 max_samples=None):
+                 max_samples=None,
+                 eval_mode=True):
     os.makedirs(output_dir, exist_ok=True)
 
     print("加载数据...")
@@ -218,7 +227,7 @@ def evaluate_all(traj_path='data/artificial_od_single.csv',
     print(f"共 {total} 条轨迹")
 
     # 统计转移概率
-    trans_mat = build_transition_matrix(traj)
+    trans_mat = build_transition_matrix()
     print(f"转移概率矩阵:")
     for i, m in enumerate(modelist):
         row = "  ".join(f"{m2}:{trans_mat[i][j]:.3f}" for j, m2 in enumerate(modelist))
@@ -273,10 +282,11 @@ def evaluate_all(traj_path='data/artificial_od_single.csv',
 
     for traj_id, indices in id_groups.items():
         scores_seq = [all_results[idx]['scores'] for idx in indices]
+        vel_seq = [all_results[idx]['vel'] for idx in indices]
         if len(indices) == 1:
             viterbi_preds[indices[0]] = int(np.argmax(scores_seq[0]))
         else:
-            path = viterbi_decode(scores_seq, trans_mat)
+            path = viterbi_decode(scores_seq, trans_mat, vel_seq=vel_seq)
             for k, idx in enumerate(indices):
                 viterbi_preds[idx] = path[k]
 
@@ -287,6 +297,7 @@ def evaluate_all(traj_path='data/artificial_od_single.csv',
     correct = 0
     labeled = 0
     per_mode = {m: {'correct': 0, 'total': 0} for m in modelist}
+    has_mode = eval_mode and 'mode' in traj.columns
 
     for i in range(total):
         r = all_results[i]
@@ -294,9 +305,9 @@ def evaluate_all(traj_path='data/artificial_od_single.csv',
         traj_id = r['traj_id']
         pred = modelist[viterbi_preds[i]]
 
-        is_ok = int(pred == true_mode) if true_mode in modelist else None
-
-        if true_mode in modelist:
+        is_ok = None
+        if has_mode and true_mode in modelist:
+            is_ok = int(pred == true_mode)
             labeled += 1
             if is_ok:
                 correct += 1
@@ -304,41 +315,49 @@ def evaluate_all(traj_path='data/artificial_od_single.csv',
             if is_ok:
                 per_mode[true_mode]['correct'] += 1
 
-        mark = "OK" if is_ok == 1 else ("MISS" if is_ok == 0 else "?")
         sm_str = "  ".join(f"{m}:{r['match'][j]:.3f}" for j, m in enumerate(modelist))
-        log.write(
-            f"[{i+1:05d}/{total}] ID={traj_id}  true={true_mode}  pred={pred}  "
-            f"{mark}  vel={r['vel']:.1f}\n"
-            f"  match=[{sm_str}]\n"
-        )
 
-        if True:
+        if has_mode:
+            mark = "OK" if is_ok == 1 else ("MISS" if is_ok == 0 else "?")
+            log.write(
+                f"[{i+1:05d}/{total}] ID={traj_id}  true={true_mode}  pred={pred}  "
+                f"{mark}  vel={r['vel']:.1f}\n"
+                f"  match=[{sm_str}]\n"
+            )
             acc = correct / labeled * 100 if labeled > 0 else 0
-            mr_str = "  ".join(f"{m}:{r['match'][j]:.3f}" for j, m in enumerate(modelist))
             print(f"  [{i+1}/{total}] ID={traj_id} true={true_mode} pred={pred} {mark} "
                   f"vel={r['vel']:.1f} acc={acc:.1f}%")
-            print(f"    match=[{mr_str}]")
+            print(f"    match=[{sm_str}]")
+        else:
+            log.write(
+                f"[{i+1:05d}/{total}] ID={traj_id}  pred={pred}  "
+                f"vel={r['vel']:.1f}\n"
+                f"  match=[{sm_str}]\n"
+            )
+            print(f"  [{i+1}/{total}] ID={traj_id} pred={pred} vel={r['vel']:.1f}%")
+            print(f"    match=[{sm_str}]")
 
     # ====== 汇总 ======
-    acc_overall = correct / labeled * 100 if labeled > 0 else 0
-
     print(f"\n{'='*60}")
-    print(f"准确率: {acc_overall:.2f}% ({correct}/{labeled})")
-    for m in modelist:
-        c = per_mode[m]['correct']
-        t = per_mode[m]['total']
-        a = c / t * 100 if t > 0 else 0
-        print(f"  {m}: {a:.2f}% ({c}/{t})")
+    if has_mode and labeled > 0:
+        acc_overall = correct / labeled * 100
+        print(f"准确率: {acc_overall:.2f}% ({correct}/{labeled})")
+        for m in modelist:
+            c = per_mode[m]['correct']
+            t = per_mode[m]['total']
+            a = c / t * 100 if t > 0 else 0
+            print(f"  {m}: {a:.2f}% ({c}/{t})")
+        log.write(f"\n准确率: {acc_overall:.2f}% ({correct}/{labeled})\n")
+        for m in modelist:
+            c = per_mode[m]['correct']
+            t = per_mode[m]['total']
+            a = c / t * 100 if t > 0 else 0
+            log.write(f"  {m}: {a:.2f}% ({c}/{t})\n")
+    else:
+        print("部署模式，无准确率统计")
+        log.write("\n部署模式，无准确率统计\n")
     print(f"{'='*60}")
 
-    log.write(f"\n{'='*60}\n")
-    log.write(f"准确率: {acc_overall:.2f}% ({correct}/{labeled})\n")
-    for m in modelist:
-        c = per_mode[m]['correct']
-        t = per_mode[m]['total']
-        a = c / t * 100 if t > 0 else 0
-        log.write(f"  {m}: {a:.2f}% ({c}/{t})\n")
-    log.write(f"{'='*60}\n")
     log.close()
     print(f"结果已保存到 {output_dir}/eval_log.txt")
 
