@@ -863,10 +863,15 @@ def write_aggregate_outputs(results, failed, args):
     all_routes_path = os.path.join(args.output_dir, "all_routes.csv")
     pd.DataFrame(all_rows).to_csv(all_routes_path, index=False, encoding="utf-8")
 
-    freq_rows = [
-        {"grid": grid, "frequency": count}
-        for grid, count in sorted(freq.items(), key=lambda item: (-item[1], item[0]))
-    ]
+    freq_rows = []
+    for cell, count in sorted(freq.items(), key=lambda item: (-item[1], item[0])):
+        parts = cell.split(",")
+        freq_rows.append({
+            "locx": int(parts[0]),
+            "locy": int(parts[1]),
+            "locz": int(parts[2]),
+            "frequency": count,
+        })
     freq_path = os.path.join(args.output_dir, "grid_frequency.csv")
     pd.DataFrame(freq_rows).to_csv(freq_path, index=False, encoding="utf-8")
 
