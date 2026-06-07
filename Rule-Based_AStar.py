@@ -206,7 +206,7 @@ def viterbi_decode(scores_seq, trans_mat, vel_seq=None, init_prob=None):
 # 主流程
 # ============================================================
 
-def evaluate_all(traj_path='data/artificial_od_mult.csv',
+def evaluate_all(traj_path='data\\dataset_20230917_nanjing_to_gaochun_lishui_with_hex_downsampled_od.csv',
                  map_path='data/hex_grid.pkl',
                  output_dir='SimpleModeResult',
                  max_samples=None,
@@ -361,6 +361,14 @@ def evaluate_all(traj_path='data/artificial_od_mult.csv',
     log.close()
     print(f"结果已保存到 {output_dir}/eval_log.txt")
 
+    # 部署模式：写入 pred_mode 列并保存
+    if not eval_mode:
+        traj['mode'] = [modelist[viterbi_preds[i]] for i in range(total)]
+        base, ext = os.path.splitext(traj_path)
+        out_path = f"{base}_pred{ext}"
+        traj.to_csv(out_path, index=False, encoding='utf-8')
+        print(f"预测结果已保存到 {out_path}")
+
 
 if __name__ == '__main__':
-    evaluate_all()
+    evaluate_all(eval_mode=False)
