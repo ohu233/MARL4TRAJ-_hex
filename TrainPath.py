@@ -7,7 +7,7 @@ import torch
 
 from utils.Environment import PathEnv
 from utils.tools import state_to_vector
-from utils.SoftActorCritic import EpisodeBuffer, SACConfig, DiscreteSACAgent
+from utils.SoftActorCritic import SACConfig, DiscreteSACAgent
 
 
 def train_sac_on_pathenv(
@@ -84,11 +84,6 @@ def train_sac_on_pathenv(
         s_vec = state_to_vector(s)
         ep_reward = 0.0
 
-        # Episode-level HER support: collect transitions and push at episode end
-        use_episode_buffer = isinstance(agent.replay, EpisodeBuffer)
-        ep_transitions = [] if use_episode_buffer else None
-        episode_meta = env.get_episode_metadata() if use_episode_buffer else None
-
         # 本回合 loss 累计
         ep_actor_losses = []
         ep_critic_losses = []
@@ -102,16 +97,10 @@ def train_sac_on_pathenv(
             else:
                 a = agent.select_action(s_vec, evaluate=False)
 
-            # Capture the pre-action neighbor for HER reward recomputation
-            pre_action_neighbor = env.neighbor.copy() if hasattr(env, 'neighbor') else None
-
             ns, r, done, success = env.step(int(a))
             ns_vec = state_to_vector(ns)
 
-            if use_episode_buffer:
-                ep_transitions.append((s_vec, int(a), float(r), ns_vec, bool(done), pre_action_neighbor))
-            else:
-                agent.replay.push(s_vec, a, r, ns_vec, float(done))
+            agent.replay.push(s_vec, a, r, ns_vec, float(done))
             s_vec = ns_vec
             ep_reward += float(r)
 
@@ -124,15 +113,6 @@ def train_sac_on_pathenv(
 
             if done:
                 break
-
-        # Episode-level push for HER
-        if use_episode_buffer and ep_transitions:
-            agent.replay.push_episode(
-                ep_transitions,
-                hex_start=episode_meta['hex_start'],
-                hex_end=episode_meta['hex_end'],
-                bfs_dist=episode_meta['bfs_dist'],
-            )
 
         match_rate = env.match_ratio
         logs.append(ep_reward)
@@ -276,10 +256,13 @@ if __name__ == "__main__":
                   distance_threshold=distance_threshold,
                   bfs_search_radius=30,
                   bfs_max_nodes=500000,
+                  potential_gamma=0.99,
+                  terminal_success=10.0,
+                  terminal_timeout_scale=5.0,
+                  offroad_scale=10.0,
                   )
 
-    # HER 配置：默认 0.8 (Future 策略)，可改为 0.0 关闭
-    sac_cfg = SACConfig(her_prob=0.0, her_strategy='future')
+    sac_cfg = SACConfig()
 
     agent, logs = train_sac_on_pathenv(env, episodes=5000, cfg=sac_cfg,
                                        metrics_window=100, use_gnn=USE_GNN)

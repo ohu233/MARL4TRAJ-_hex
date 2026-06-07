@@ -6,12 +6,12 @@ import torch
 from utils.SoftActorCritic import DiscreteSACAgent, SACConfig
 from utils.tools import state_to_vector
 from utils.hex_utils import (
-    HEX_DIRECTIONS, ACTION_TO_HEX_IDX,
-    hex_distance, hex_is_valid, hex_add, hex_sub,
-    get_hex_neighborhood, load_hex_mapdata, load_hex_mapdata_raw,
+    HEX_DIRECTIONS,
+    hex_distance, hex_add, hex_sub,
+    get_hex_neighborhood, load_hex_mapdata_raw,
     code_to_mode_matrices,
     find_nearest_road_cell, find_k_nearest_road_cells,
-    build_bfs_distance_field, build_bfs_distance_field_from_multiple,
+    build_bfs_distance_field_from_multiple,
     HEX_RADIUS, _hex_ring_offsets,
 )
 
@@ -41,12 +41,12 @@ class PathEnv:
                  distance_threshold: float = 1.0,                   # 成功判定的距离阈值
                  bfs_search_radius: int = 10,                       # BFS 搜索半径
                  bfs_max_nodes: int = 50000,                        # BFS 距离场最大节点数
-                 reward_alpha: float = 0.3,                         # 势能场 cube 距离变化系数 α·ΔD_cube
-                 reward_beta: float = 0.7,                          # 势能场路网距离变化系数 β·ΔD_net
-                 step_penalty: float = 0.1,                         # 每步代价，抑制绕路
-                 offroad_penalty: float = 8.0,                      # 离开选中路网的惩罚
                  adsorption_radius: int = 20,                       # 吸附集合 C_D 的搜索半径
                  adsorption_K: int = 3,                             # C_D 中保留的最近路网点数量
+                 potential_gamma: float = 0.99,                     # 势能场折扣（应与 SAC gamma 一致）
+                 terminal_success: float = 10.0,                    # 成功到达终点的奖励
+                 terminal_timeout_scale: float = 5.0,               # 超时惩罚系数
+                 offroad_scale: float = 10.0,                       # 离路代价放大系数（模拟 A* 只在路网展开）
                  ):
 
         self.selected_mode = selected_mode
@@ -61,13 +61,15 @@ class PathEnv:
         self._road_end = None
         self._C_D = None
 
-        # 势能场奖励参数
-        self.reward_alpha = reward_alpha
-        self.reward_beta = reward_beta
-        self.step_penalty = float(step_penalty)
-        self.offroad_penalty = float(offroad_penalty)
+        # 吸附参数
         self.adsorption_radius = adsorption_radius
         self.adsorption_K = adsorption_K
+
+        # 势能场参数
+        self.potential_gamma = potential_gamma
+        self.terminal_success = terminal_success
+        self.terminal_timeout_scale = terminal_timeout_scale
+        self.offroad_scale = offroad_scale
 
         # 加载 hex 地图数据
         first_key = next(iter(mapdata)) if mapdata else None
@@ -256,41 +258,6 @@ class PathEnv:
 
         return (locxo, locyo, loczo), (locxd, locyd, loczd)
 
-    def _build_hex_spatial_index(self):
-        """为 hex_mapdata_raw 构建 kd-tree 空间索引。"""
-        if self.hex_mapdata_raw is None:
-            self._hex_kd_keys = []
-            self._hex_kd_tree = None
-            return
-
-        from scipy.spatial import cKDTree
-        keys = list(self.hex_mapdata_raw.keys())
-        lons = np.array([self.hex_mapdata_raw[k]['lon'] for k in keys])
-        lats = np.array([self.hex_mapdata_raw[k]['lat'] for k in keys])
-        points = np.column_stack([lons, lats])
-        self._hex_kd_keys = keys
-        self._hex_kd_tree = cKDTree(points)
-
-    def _wgs84_to_hex(self, lon, lat):
-        """WGS84 经纬度 → 最近 hex cube 坐标（kd-tree 查找）。"""
-        if self.hex_mapdata_raw is None:
-            return (0.0, 0.0, 0.0)
-
-        if not hasattr(self, '_hex_kd_tree') or self._hex_kd_tree is None:
-            self._build_hex_spatial_index()
-
-        if self._hex_kd_tree is None:
-            return (0.0, 0.0, 0.0)
-
-        dist, idx = self._hex_kd_tree.query([lon, lat])
-        key = self._hex_kd_keys[idx]
-        return tuple(float(v) for v in key)
-
-    def _get_map_value(self, mode, q, r, s):
-        """安全获取地图值，不存在返回 0。"""
-        key = (int(round(q)), int(round(r)), int(round(s)))
-        return self.mapdata[mode].get(key, 0)
-
     def _is_on_selected_road(self, pos):
         key = (int(round(pos[0])), int(round(pos[1])), int(round(pos[2])))
         return self.multi_mapdata.get(key, 0) != 0
@@ -301,51 +268,34 @@ class PathEnv:
         if self.min_mode_count > self.max_mode_count:
             self.min_mode_count = self.max_mode_count
 
-    def calculate_reward(self, reward, prev_dist, curr_dist, neighbor, action,
-                         prev_cube_dist=None, curr_cube_dist=None):
+    def calculate_reward(self, prev_dist, curr_dist):
         """
-        势能场奖励：R_dist = α·ΔD_cube + β·ΔD_eff
+        势能场塑形：R = γ · (D_eff(s) - D_eff(s')) / D_eff(s₀)
 
-        ΔD_cube = D_cube(s_t, D) - D_cube(s_{t+1}, D)  (cube 距离变化)
-        ΔD_eff = D_eff(s_t, D) - D_eff(s_{t+1}, D)    (有效路网距离变化)
-        α = reward_alpha, β = reward_beta
+        基于 Ng, Harada, Russell (1999) 的势能场塑形定理，
+        不改变最优策略，但大幅加速学习。
         """
-        if prev_cube_dist is None:
-            prev_cube_dist = hex_distance(self.hex_start, self.hex_end)
-        if curr_cube_dist is None:
-            curr_cube_dist = hex_distance(self.hex_start, self.hex_end)
-
-        delta_cube = prev_cube_dist - curr_cube_dist
-        delta_net = prev_dist - curr_dist
-
-        is_on_road = neighbor[ACTION_TO_HEX_IDX[action]] != 0
-
-        r_dist_cube = self.reward_alpha * delta_cube
-        r_dist_net = self.reward_beta * delta_net
-
-        reward += r_dist_cube + r_dist_net
-
-        if is_on_road:
-            reward += 1.0
-        else:
-            reward -= self.offroad_penalty
-
-        return reward
+        delta = prev_dist - curr_dist  # 正值=靠近终点
+        shaped = self.potential_gamma * delta / self.initial_bfs_distance
+        return shaped
 
     def _adsorption_distance_to_C_D(self, pos):
         """
-        计算吸附距离 D_net(p, D) = min_{v ∈ C_p} [d_cube(p, v) + d_net(v, C_D)]
+        计算吸附距离 D_net(p, D) = min_{v ∈ C_p} [offroad_scale * d_cube(p, v) + d_net(v, C_D)]
 
         C_p = {v ∈ G_allowed | d_cube(p, v) ≤ r}
         d_net(v, C_D) 从多源 BFS 距离场直接查询
+
+        offroad_scale: 离路代价放大系数。A* 只在路网节点展开（隐含 offroad_scale=∞），
+        这里用有限值（默认10）让势能场强烈偏好路网路径，同时允许离路吸附。
         """
         pos_key = (int(round(pos[0])), int(round(pos[1])), int(round(pos[2])))
 
-        # 已在 BFS 距离场中，直接返回
+        # 已在 BFS 距离场中（即路网点），直接返回
         if self._bfs_dist is not None and pos_key in self._bfs_dist:
             return float(self._bfs_dist[pos_key])
 
-        # 否则枚举 C_p（半径 r 内的路网点）
+        # 离路点：枚举 C_p（半径 r 内的路网点），离路部分乘以 offroad_scale
         best = float('inf')
         for ring_r in range(self.adsorption_radius + 1):
             for dq, dr, ds in _hex_ring_offsets(ring_r):
@@ -356,11 +306,12 @@ class PathEnv:
                     d_net_v = self._bfs_dist[cp_key]
                 else:
                     continue
-                candidate = ring_r + d_net_v
+                # 离路代价 = offroad_scale × cube距离 + 路网BFS距离
+                candidate = ring_r * self.offroad_scale + d_net_v
                 if candidate < best:
                     best = candidate
 
-        return float(best) if best != float('inf') else float(hex_distance(pos, self.hex_end))
+        return float(best) if best != float('inf') else float(hex_distance(pos, self.hex_end)) * self.offroad_scale
 
     def _effective_distance_to_goal(self, pos):
         """
@@ -376,25 +327,34 @@ class PathEnv:
             d_extra = hex_distance(pos, self.hex_end)
         return d_net + d_extra
 
-    def get_episode_metadata(self):
-        """Return episode-level metadata needed by HER/EpisodeBuffer."""
-        return {
-            'hex_start': tuple(self.hex_start),
-            'hex_end': tuple(self.hex_end),
-            'bfs_dist': self._bfs_dist,
-            'road_end': self._road_end,
-            'C_D': self._C_D,
-        }
+    def _has_road_neighbor(self, pos):
+        """检查 pos 是否有至少一个路网邻居。"""
+        for dq, dr, ds in HEX_DIRECTIONS:
+            nb = (pos[0]+dq, pos[1]+dr, pos[2]+ds)
+            if self.multi_mapdata.get(nb, 0) != 0:
+                return True
+        return False
+
+    def _is_valid_road_move(self, pos, action):
+        """检查 action 方向的目标格子是否在路网上。"""
+        dq, dr, ds = HEX_DIRECTIONS[action]
+        target = (pos[0]+dq, pos[1]+dr, pos[2]+ds)
+        return self.multi_mapdata.get(target, 0) != 0
 
     def step(self, action: int):
         '''
-        采取动作，计算奖励，更新状态
+        采取动作，计算奖励，更新状态。
+
+        A* 式移动约束：
+        - 如果目标格在路网上 → 正常移动（等价于 A* 扩展路网邻居）
+        - 如果目标格不在路网，且当前位置有路网邻居 → 原地不动，扣罚（拒绝离路）
+        - 如果目标格不在路网，且当前位置无路网邻居 → 允许移动（吸附阶段）
         '''
         if action < 0 or action >= len(HEX_DIRECTIONS):
             raise ValueError(f"Invalid PathEnv action {action}; expected 0-{len(HEX_DIRECTIONS) - 1}.")
 
         success = 0
-        reward = -self.step_penalty
+        reward = 0.0
         done = False
         self.step_cnt += 1
 
@@ -403,8 +363,28 @@ class PathEnv:
         pre_move_cube_dist = hex_distance(pre_move_pos, self.hex_end)
         pre_move_bfs_dist = self._effective_distance_to_goal(pre_move_pos)
 
-        # 更新绝对坐标
-        self.hex_start = hex_add(self.hex_start, HEX_DIRECTIONS[action])
+        # A* 式移动约束
+        target = hex_add(self.hex_start, HEX_DIRECTIONS[action])
+        target_on_road = self._is_on_selected_road(target)
+        has_road_nb = self._has_road_neighbor(self.hex_start)
+
+        if not target_on_road and has_road_nb:
+            # 拒绝离路移动：原地不动，扣罚 1 步
+            reward -= 1.0
+            # 仍更新观测
+            self.state['previous_remaining_distance'] = self.state['remaining_distance']
+            self.neighbor = get_hex_neighborhood(
+                self.multi_mapdata, *self.hex_start, radius=1
+            )
+            self.state['patch'] = self._build_patch(self.hex_start)
+            if self.step_cnt >= self.max_step:
+                final_phi = 1.0 - (pre_move_bfs_dist / self.initial_bfs_distance)
+                reward -= self.terminal_timeout_scale * (1.0 - max(0.0, final_phi))
+                done = True
+            return self.state, reward, done, success
+
+        # 允许移动：目标在路网上 OR 吸附阶段（无路网邻居）
+        self.hex_start = target
 
         self.visited_points += 1
         self.on_road_points += int(self._is_on_selected_road(self.hex_start))
@@ -425,13 +405,8 @@ class PathEnv:
             float(curr_bfs_dist) / self.initial_bfs_distance
         )
 
-        # 计算奖励（势能场公式）
-        reward = self.calculate_reward(
-            reward, pre_move_bfs_dist, curr_bfs_dist,
-            self.neighbor, action,
-            prev_cube_dist=pre_move_cube_dist,
-            curr_cube_dist=curr_cube_dist,
-        )
+        # 势能场奖励
+        reward += self.calculate_reward(pre_move_bfs_dist, curr_bfs_dist)
 
         # 更新 neighbor
         self.neighbor = get_hex_neighborhood(
@@ -444,11 +419,12 @@ class PathEnv:
             self._is_on_selected_road(self.hex_start)
             and curr_cube_dist <= self.distance_threshold
         ):
-            reward += 50.0 * self.match_ratio
+            reward += self.terminal_success
             done = True
             success = 1
         elif self.step_cnt >= self.max_step:
-            reward -= 20.0 * (1.0 - self.match_ratio)
+            final_phi = 1.0 - (curr_bfs_dist / self.initial_bfs_distance)
+            reward -= self.terminal_timeout_scale * (1.0 - max(0.0, final_phi))
             done = True
 
         return self.state, reward, done, success

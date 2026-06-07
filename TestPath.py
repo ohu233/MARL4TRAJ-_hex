@@ -13,7 +13,7 @@ from utils.hex_utils import hex_distance
 
 # ========== 配置 ==========
 TRAJ_CSV = 'data/artificial_od_single.csv'
-MODEL_PATH = "PathModel\sac_actor_ep5000.pth"
+MODEL_PATH = "PathModel\sac_actor_ep3000.pth"
 SAVE_DIR = "TestPath_results"
 FOV = 5
 USE_GNN = False
@@ -359,6 +359,10 @@ def load_env(traj_df, test_mode_selection: str = 'all', fov: int = 3):
         traj=traj_df,
         FOV=fov,
         distance_threshold=1.0,
+        potential_gamma=0.99,
+        terminal_success=10.0,
+        terminal_timeout_scale=5.0,
+        offroad_scale=10.0,
     )
     return env
 
