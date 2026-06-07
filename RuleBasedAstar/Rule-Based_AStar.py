@@ -11,6 +11,7 @@ modelist = ['GSD', 'GG', 'TS', 'TG']
 
 MODE_VEL_MEAN = {'GG': 30.14, 'GSD': 13.32, 'TS': 50.01, 'TG': 95.65}
 MODE_VEL_STD  = {'GG': 20.13, 'GSD': 15.45, 'TS': 29.61, 'TG': 56.29}
+MIN_SPEED_SCORE = 0.05
 
 HEX_DIRECTIONS = [
     (0, -1, +1),
@@ -73,7 +74,31 @@ def code_to_mode_matrices(hex_mapdata):
 def speed_score(velocity, mode):
     mu = MODE_VEL_MEAN[mode]
     sigma_sq = max(MODE_VEL_STD[mode] ** 2, 1.0)
-    return math.exp(-0.5 * (velocity - mu) ** 2 / sigma_sq)
+    return max(MIN_SPEED_SCORE, math.exp(-0.5 * (velocity - mu) ** 2 / sigma_sq))
+
+
+def observation_score(match_rate, success, progress, snap_dist_start, snap_dist_end):
+    snap_score = 1.0 / (1.0 + snap_dist_start + snap_dist_end)
+    endpoint_score = max(progress, 1.0 if success else 0.0)
+    return 0.5 * match_rate + 0.3 * endpoint_score + 0.2 * snap_score
+
+
+def row_velocity(row):
+    if 'velocity' in row.index:
+        try:
+            vel = float(row['velocity'])
+            if math.isfinite(vel):
+                return vel
+        except (TypeError, ValueError):
+            pass
+    if 'distance_m' in row.index and 'time' in row.index:
+        try:
+            t = float(row['time'])
+            if t > 0:
+                return float(row['distance_m']) / t
+        except (TypeError, ValueError):
+            pass
+    return 0.0
 
 
 def astar(road_map, start, goal, max_nodes=50000):
@@ -111,24 +136,41 @@ def astar(road_map, start, goal, max_nodes=50000):
     return None
 
 
-def eval_single_mode(road_map, hex_start, hex_end, distance_threshold=1.0):
+def eval_single_mode(road_map, hex_start, hex_end, road_start=None, distance_threshold=1.0):
+    """对单个模式做 A* 评估。road_start 为 None 时自动吸附，否则使用给定路网起点。"""
     initial_distance = max(float(hex_distance(hex_start, hex_end)), 1.0)
-    road_start = find_nearest_road_cell(*hex_start, road_map, max_radius=30)
+    if road_start is None:
+        road_start = find_nearest_road_cell(*hex_start, road_map, max_radius=30)
     road_end = find_nearest_road_cell(*hex_end, road_map, max_radius=30)
     if road_start is None or road_end is None:
-        return 0.0, 0, 0.0
+        return 0.0, 0, 0.0, 0.0, None
     snap_dist_start = hex_distance(hex_start, road_start)
     snap_dist_end = hex_distance(hex_end, road_end)
     path = astar(road_map, road_start, road_end)
     if path is None:
-        return 0.0, 0, 0.0
+        return 0.0, 0, 0.0, 0.0, None
     astar_len = len(path) - 1
     total_len = snap_dist_start + astar_len + snap_dist_end
     match_rate = astar_len / total_len if total_len > 0 else 0.0
     final_distance = hex_distance(road_end, hex_end)
     success = 1 if final_distance <= distance_threshold else 0
     progress = max(0.0, min(1.0, (initial_distance - final_distance) / initial_distance))
-    return match_rate, success, progress
+    obs_score = observation_score(match_rate, success, progress, snap_dist_start, snap_dist_end)
+    return match_rate, success, progress, obs_score, road_end
+
+
+def eval_id_sequence(road_map, hex_starts, hex_ends):
+    """对同一 ID 的段序列做链式评估，相邻段共享路网锚点。"""
+    results = []
+    prev_road_end = None
+    for _i, (hs, he) in enumerate(zip(hex_starts, hex_ends)):
+        mr, sc, pg, obs, road_end = eval_single_mode(
+            road_map, hs, he,
+            road_start=prev_road_end,
+        )
+        results.append((mr, sc, pg, obs))
+        prev_road_end = road_end
+    return results
 
 
 # ============================================================
@@ -233,48 +275,63 @@ def evaluate_all(traj_path='data\\dataset_20230917_nanjing_to_gaochun_lishui_wit
         row = "  ".join(f"{m2}:{trans_mat[i][j]:.3f}" for j, m2 in enumerate(modelist))
         print(f"  {m} -> [{row}]")
 
-    # ====== 第一遍：计算每段分数 ======
+    # ====== 第一遍：计算每段分数（按 ID 分组、链式评估） ======
     print("\n第一遍：计算每段分数...")
-    # 按 ID 分组存储
-    id_groups = defaultdict(list)  # {id: [(global_idx, scores, true_mode), ...]}
-    all_results = []  # [(scores, independent_pred, true_mode, traj_id, vel), ...]
+    all_results = []
+    id_groups = defaultdict(list)
 
+    # 先按 ID 分组收集原始数据
+    id_data = defaultdict(list)  # {id: [(global_idx, hex_start, hex_end, vel, true_mode), ...]}
     for i in range(total):
         row = traj.iloc[i]
         true_mode = str(row.get('mode', '')).strip() if 'mode' in traj.columns else None
         traj_id = str(row.get('ID', f'row_{i}')).strip()
+        hs = (int(round(row['locxo'])), int(round(row['locyo'])), int(round(row['loczo'])))
+        he = (int(round(row['locxd'])), int(round(row['locyd'])), int(round(row['loczd'])))
+        vel = row_velocity(row)
+        id_data[traj_id].append((i, hs, he, vel, true_mode))
 
-        hex_start = (int(round(row['locxo'])), int(round(row['locyo'])), int(round(row['loczo'])))
-        hex_end = (int(round(row['locxd'])), int(round(row['locyd'])), int(round(row['loczd'])))
+    for traj_id, segments in id_data.items():
+        indices = [s[0] for s in segments]
+        hex_starts = [s[1] for s in segments]
+        hex_ends = [s[2] for s in segments]
+        vels = [s[3] for s in segments]
+        true_modes = [s[4] for s in segments]
 
-        single_match, single_success, single_progress = [], [], []
+        # 对每个模式链式评估
+        mode_results = {}
         for m in modelist:
-            mr, sc, pg = eval_single_mode(mode_maps[m], hex_start, hex_end)
-            single_match.append(mr)
-            single_success.append(sc)
-            single_progress.append(pg)
+            mode_results[m] = eval_id_sequence(mode_maps[m], hex_starts, hex_ends)
 
-        vel = 0.0
-        if 'distance_m' in traj.columns and 'time' in traj.columns:
-            t = float(row['time'])
-            if t > 0:
-                vel = float(row['distance_m']) / t
-        single_speed = [speed_score(vel, m) for m in modelist]
+        for k in range(len(segments)):
+            single_match, single_success, single_progress, single_obs = [], [], [], []
+            for m in modelist:
+                mr, sc, pg, obs = mode_results[m][k]
+                single_match.append(mr)
+                single_success.append(sc)
+                single_progress.append(pg)
+                single_obs.append(obs)
 
-        scores = [single_match[j] * single_speed[j] for j in range(len(modelist))]
+            single_speed = [speed_score(vels[k], m) for m in modelist]
+            scores = [single_obs[j] * single_speed[j] for j in range(len(modelist))]
 
-        all_results.append({
-            'scores': scores,
-            'match': single_match,
-            'speed': single_speed,
-            'true_mode': true_mode,
-            'traj_id': traj_id,
-            'vel': vel,
-        })
-        id_groups[traj_id].append(i)
+            result_index = len(all_results)
+            all_results.append({
+                'scores': scores,
+                'obs': single_obs,
+                'match': single_match,
+                'success': single_success,
+                'progress': single_progress,
+                'speed': single_speed,
+                'true_mode': true_modes[k],
+                'traj_id': traj_id,
+                'vel': vels[k],
+                '_gidx': indices[k],
+            })
+            id_groups[traj_id].append(result_index)
 
-        if (i + 1) % 100 == 0 or i == 0:
-            print(f"  [{i+1}/{total}] scored")
+        if (len(all_results)) % 100 == 0 or len(all_results) <= len(segments):
+            print(f"  [{len(all_results)}/{total}] scored")
 
     # ====== 第二遍：Viterbi 解码 ======
     print("\n第二遍：Viterbi 解码...")
@@ -316,6 +373,9 @@ def evaluate_all(traj_path='data\\dataset_20230917_nanjing_to_gaochun_lishui_wit
                 per_mode[true_mode]['correct'] += 1
 
         sm_str = "  ".join(f"{m}:{r['match'][j]:.3f}" for j, m in enumerate(modelist))
+        obs_str = "  ".join(f"{m}:{r['obs'][j]:.3f}" for j, m in enumerate(modelist))
+        speed_str = "  ".join(f"{m}:{r['speed'][j]:.3f}" for j, m in enumerate(modelist))
+        score_str = "  ".join(f"{m}:{r['scores'][j]:.3f}" for j, m in enumerate(modelist))
 
         if has_mode:
             mark = "OK" if is_ok == 1 else ("MISS" if is_ok == 0 else "?")
@@ -323,19 +383,25 @@ def evaluate_all(traj_path='data\\dataset_20230917_nanjing_to_gaochun_lishui_wit
                 f"[{i+1:05d}/{total}] ID={traj_id}  true={true_mode}  pred={pred}  "
                 f"{mark}  vel={r['vel']:.1f}\n"
                 f"  match=[{sm_str}]\n"
+                f"  obs=[{obs_str}]\n"
+                f"  speed=[{speed_str}]\n"
+                f"  score=[{score_str}]\n"
             )
             acc = correct / labeled * 100 if labeled > 0 else 0
             print(f"  [{i+1}/{total}] ID={traj_id} true={true_mode} pred={pred} {mark} "
                   f"vel={r['vel']:.1f} acc={acc:.1f}%")
-            print(f"    match=[{sm_str}]")
+            print(f"    match=[{sm_str}] obs=[{obs_str}]")
         else:
             log.write(
                 f"[{i+1:05d}/{total}] ID={traj_id}  pred={pred}  "
                 f"vel={r['vel']:.1f}\n"
                 f"  match=[{sm_str}]\n"
+                f"  obs=[{obs_str}]\n"
+                f"  speed=[{speed_str}]\n"
+                f"  score=[{score_str}]\n"
             )
             print(f"  [{i+1}/{total}] ID={traj_id} pred={pred} vel={r['vel']:.1f}%")
-            print(f"    match=[{sm_str}]")
+            print(f"    match=[{sm_str}] obs=[{obs_str}]")
 
     # ====== 汇总 ======
     print(f"\n{'='*60}")
